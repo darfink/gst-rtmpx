@@ -1,4 +1,13 @@
+<div align="center">
+
 ## gst-rtmpx — RTMP source / sink on rtmpx (URI-only)
+
+[![CI][ci-shield]][ci]
+[![Version][version-shield]][releases]
+[![GStreamer][gstreamer-shield]][gstreamer]
+[![License][license-shield]][license]
+
+</div>
 
 Both elements double as a listener: `rtmpxsrc` accepts incoming publisher
 connections, and `rtmpxsink` waits for and serves incoming player
@@ -60,3 +69,12 @@ cargo build -p gst-rtmpx
 export GST_PLUGIN_PATH=$PWD/target/debug
 gst-inspect-1.0 rtmpxsrc rtmpxsink
 ```
+
+[ci-shield]: https://img.shields.io/github/actions/workflow/status/darfink/gst-rtmpx/ci.yml?branch=main&label=CI&logo=github&style=for-the-badge
+[ci]: https://github.com/darfink/gst-rtmpx/actions/workflows/ci.yml?query=branch%3Amain
+[version-shield]: https://img.shields.io/github/v/tag/darfink/gst-rtmpx?style=for-the-badge&label=version
+[releases]: https://github.com/darfink/gst-rtmpx/releases
+[gstreamer-shield]: https://img.shields.io/badge/GStreamer-1.28+-orange?style=for-the-badge
+[gstreamer]: https://gstreamer.freedesktop.org/
+[license-shield]: https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green?style=for-the-badge
+[license]: https://github.com/darfink/gst-rtmpx

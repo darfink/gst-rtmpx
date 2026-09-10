@@ -1,4 +1,15 @@
-# gst-rtmpx
+<div align="center">
+
+# `gst-rtmpx`
+
+## GStreamer RTMP source & sink with built-in listen modes
+
+[![CI][ci-shield]][ci]
+[![Version][version-shield]][releases]
+[![GStreamer][gstreamer-shield]][gstreamer]
+[![License][license-shield]][license]
+
+</div>
 
 GStreamer source and sink elements for RTMP, built on the
 [rtmpx](https://github.com/darfink/rtmpx) protocol crate.
@@ -19,7 +30,9 @@ full property and behaviour reference.
 
 ## Examples
 
-Receive from a publisher and demux:
+Listen for a publisher and demux — the source is the server, so no
+separate RTMP server is needed. Publish to it with `ffmpeg` or any RTMP
+encoder at `rtmp://127.0.0.1:1935/live/test`:
 
 ```sh
 gst-launch-1.0 -e rtmpxsrc uri=rtmp://0.0.0.0:1935/live ! flvdemux name=demux \
@@ -27,7 +40,16 @@ gst-launch-1.0 -e rtmpxsrc uri=rtmp://0.0.0.0:1935/live ! flvdemux name=demux \
   demux.audio ! queue ! aacparse ! fakesink sync=false
 ```
 
-Publish from the sink, then play it back through the source:
+Serve players directly from the sink — it waits for an incoming player
+connection and applies backpressure until one arrives. Play
+`rtmp://127.0.0.1:1935/live/test` with `ffplay` or any RTMP player:
+
+```sh
+gst-launch-1.0 -e videotestsrc ! x264enc tune=zerolatency ! flvmux ! \
+  rtmpxsink mode=listen uri=rtmp://0.0.0.0:1935/live/test
+```
+
+Or publish from the sink to a server, then play it back through the source:
 
 ```sh
 gst-launch-1.0 -e videotestsrc ! x264enc ! flvmux ! rtmpxsink uri=rtmp://127.0.0.1:1935/live/test
@@ -92,3 +114,12 @@ docker run --rm -p 1935:1935 gst-rtmpx
 ## License
 
 MIT OR Apache-2.0. See `LICENSE-MIT` and `LICENSE-APACHE`.
+
+[ci-shield]: https://img.shields.io/github/actions/workflow/status/darfink/gst-rtmpx/ci.yml?branch=main&label=CI&logo=github&style=for-the-badge
+[ci]: https://github.com/darfink/gst-rtmpx/actions/workflows/ci.yml?query=branch%3Amain
+[version-shield]: https://img.shields.io/github/v/tag/darfink/gst-rtmpx?style=for-the-badge&label=version
+[releases]: https://github.com/darfink/gst-rtmpx/releases
+[gstreamer-shield]: https://img.shields.io/badge/GStreamer-1.28+-orange?style=for-the-badge
+[gstreamer]: https://gstreamer.freedesktop.org/
+[license-shield]: https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green?style=for-the-badge
+[license]: https://github.com/darfink/gst-rtmpx
