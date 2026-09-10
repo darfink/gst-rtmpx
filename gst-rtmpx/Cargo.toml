@@ -19,7 +19,7 @@ bytes = "1.12"
 # Protocol sessions (client + server) come from the rtmpx crate on GitHub.
 # Pinned to main via Cargo.lock; switch to a crates.io version once published.
 rtmpx = { git = "https://github.com/darfink/rtmpx", branch = "main" }
-flume = "0.11"
+flume = "0.12"
 gst = { package = "gstreamer", version = "0.25.3", features = ["v1_28"] }
 gst-base = { package = "gstreamer-base", version = "0.25.3", features = ["v1_28"] }
 tokio = { version = "1.53", features = ["macros", "net", "rt", "sync", "time", "io-util"] }
