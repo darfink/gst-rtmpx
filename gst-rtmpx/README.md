@@ -11,7 +11,7 @@ A missing app or stream key in listen mode means "accept any".
 Both speak plain `rtmp://` and encrypted `rtmps://` (RTMP over TLS). The scheme
 decides the transport: `rtmps://` clients verify the server against the
 platform trust store plus `tls-ca-cert`, and `rtmps://` listeners present the
-`tls-cert` / `tls-key` pair.
+`tls-cert` / `tls-key` pair (setting `tls-ca-cert` there requires an mTLS client certificate).
 
 ### rtmpxsrc
 
@@ -35,7 +35,7 @@ for a publisher.
 | `reconnect` | boolean | `false` | Play: reconnect and resume after the server disconnects. |
 | `tls-cert` | string | (none) | Certificate presented (`rtmps://`): server certificate in listen mode (required); mTLS client certificate in play mode (optional, needs `tls-key`). |
 | `tls-key` | string | (none) | PEM private key matching `tls-cert`. |
-| `tls-ca-cert` | string | (none) | Play with `rtmps://`: extra PEM CA bundle trusted alongside the platform store. |
+| `tls-ca-cert` | string | (none) | Extra PEM CA bundle alongside the platform store. Play (`rtmps://`): which servers to trust. Listen (`rtmps://`): when set, require an mTLS client certificate. |
 
 Signals and events: no GObject signals. Emits downstream custom events
 `rtmpx-publish-start` (`connection-id`) and `rtmpx-publish-end` (`connection-id`,
@@ -68,7 +68,7 @@ publishes; `mode=listen` binds `rtmp://bind-host:port[/app[/key]]` and serves pl
 | `write-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed per socket write; `0` disables. |
 | `tls-cert` | string | (none) | Certificate presented (`rtmps://`): server certificate in listen mode (required); mTLS client certificate in publish mode (optional, needs `tls-key`). |
 | `tls-key` | string | (none) | PEM private key matching `tls-cert`. |
-| `tls-ca-cert` | string | (none) | Publish with `rtmps://`: extra PEM CA bundle trusted alongside the platform store. |
+| `tls-ca-cert` | string | (none) | Extra PEM CA bundle alongside the platform store. Publish (`rtmps://`): which servers to trust. Listen (`rtmps://`): when set, require an mTLS client certificate. |
 
 Signals and events: none. No GObject signals, downstream events, or bus messages.
 

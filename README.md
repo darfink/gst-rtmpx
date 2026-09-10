@@ -20,7 +20,9 @@ connections — no separate server element needed.
 
 Both also speak encrypted RTMP (RTMPS): use an `rtmps://` URI and the scheme
 selects TLS. Clients verify the server against the platform trust store plus
-`tls-ca-cert`; listeners present the `tls-cert` / `tls-key` pair.
+`tls-ca-cert`; listeners present the `tls-cert` / `tls-key` pair, and
+setting `tls-ca-cert` on a listener requires connecting clients to present an
+mTLS certificate verifiable against that bundle plus the platform store.
 
 Both elements advertise Enhanced RTMP, so modern encoders and servers keep
 negotiating HEVC/AV1/multitrack alongside classic H264/AAC.
@@ -68,11 +70,13 @@ gst-launch-1.0 -e videotestsrc ! x264enc tune=zerolatency ! flvmux ! rtmpxsink m
 
 Use `rtmps://` instead of `rtmp://` and the element negotiates TLS before the
 RTMP handshake. A listener needs a certificate and key; a client trusts the
-platform store, with `tls-ca-cert` as an override for private or self-signed CAs:
+platform store, with `tls-ca-cert` as an override for private or self-signed CAs.
+Setting `tls-ca-cert` on a listener requires an mTLS client certificate:
 
 ```sh
 gst-launch-1.0 -e rtmpxsrc mode=listen uri=rtmps://0.0.0.0:1935/live tls-cert=/etc/rtmpx/cert.pem tls-key=/etc/rtmpx/key.pem ! flvdemux ! fakesink
 gst-launch-1.0 -e rtmpxsrc uri=rtmps://example.com:443/live/test tls-ca-cert=/etc/rtmpx/ca.pem ! flvdemux ! fakesink
+gst-launch-1.0 -e rtmpxsrc mode=listen uri=rtmps://0.0.0.0:1935/live tls-cert=/etc/rtmpx/cert.pem tls-key=/etc/rtmpx/key.pem tls-ca-cert=/etc/rtmpx/client-ca.pem ! flvdemux ! fakesink
 ```
 
 ## Build

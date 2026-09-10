@@ -226,7 +226,7 @@ impl ObjectImpl for RtmpxSrc {
           .build(),
         glib::ParamSpecString::builder("tls-ca-cert")
           .nick("TLS CA certificate")
-          .blurb("Play mode with an rtmps:// uri: path to an extra PEM CA bundle trusted in addition to the platform store (e.g. a self-signed server certificate)")
+          .blurb("Extra PEM CA bundle trusted in addition to the platform store. Play mode (rtmps://): which servers to trust. Listen mode (rtmps://): when set, require an mTLS client certificate verifiable against this bundle plus the platform store")
           .mutable_ready()
           .build(),
       ]
@@ -402,6 +402,7 @@ impl RtmpxSrc {
       endpoint.tls,
       settings.tls_cert.as_deref(),
       settings.tls_key.as_deref(),
+      settings.tls_ca_cert.as_deref(),
       "rtmpxsrc listen mode",
     )
     .map_err(|message| gst::error_msg!(gst::ResourceError::Settings, ["{message}"]))?;
