@@ -90,33 +90,35 @@ cargo build --release
 ```
 
 Prefer not to build? Each [release](https://github.com/darfink/gst-rtmpx/releases)
-ships prebuilt `libgstrtmpx` libraries for Linux (`.so`) and macOS (`.dylib`);
-drop one onto `GST_PLUGIN_PATH` or install it per below.
+ships prebuilt libraries for Linux (`.so`) and macOS (`.dylib`); use one
+wherever steps 2–3 reference the file you built.
 
-This uses GST_PLUGIN_PATH, so no install or root access is needed.
+1. Try it straight from the build tree:
 
 ```sh
 export GST_PLUGIN_PATH="$PWD/target/release"
 gst-inspect-1.0 rtmpxsrc rtmpxsink
 ```
 
-For a permanent install instead of `GST_PLUGIN_PATH`:
+2. Install for your user:
 
 ```sh
-# System-wide (needs root):
-sudo install -m 0755 target/release/libgstrtmpx.so "$(pkg-config --variable=pluginsdir gstreamer-1.0)/"
-# Or just for your user (no root needed):
+mkdir -p ~/.local/share/gstreamer-1.0/plugins
 install -m 0755 target/release/libgstrtmpx.so ~/.local/share/gstreamer-1.0/plugins/
 ```
 
 (On macOS the file is `libgstrtmpx.dylib`.)
 
-On macOS with the GStreamer framework build, point pkg-config at it first:
+3. Or system-wide (needs root):
+
+```sh
+sudo install -m 0755 target/release/libgstrtmpx.so "$(pkg-config --variable=pluginsdir gstreamer-1.0)/"
+```
+
+If you installed GStreamer from its official macOS framework installer (not Homebrew), export this first so `pkg-config` finds it:
 
 ```sh
 export PKG_CONFIG_PATH=/Library/Frameworks/GStreamer.framework/Versions/Current/lib/pkgconfig:$PKG_CONFIG_PATH
-export DYLD_FALLBACK_LIBRARY_PATH=/Library/Frameworks/GStreamer.framework/Versions/Current/lib:$DYLD_FALLBACK_LIBRARY_PATH
-export PATH=/Library/Frameworks/GStreamer.framework/Versions/Current/bin:$PATH
 ```
 
 The `rtmpx` protocol dependency is fetched from GitHub as a git dependency
