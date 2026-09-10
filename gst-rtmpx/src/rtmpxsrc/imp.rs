@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use crate::common::{
   CAT_SRC as CAT, CREATE_POLL_INTERVAL, ClientEndpoint, FLV_TAG_AUDIO, FLV_TAG_SCRIPT_DATA,
-  FLV_TAG_VIDEO, FlvTagWriter, OUTPUT_QUEUE_CAPACITY, PublishIds, SessionFailure,
-  WORKER_START_TIMEOUT, WorkerOutput, bracketed_host, client_handshake, enhanced_rtmp_capabilities,
-  nanoseconds_timeout, new_client_session, parse_rtmp_uri, publish_event, read_session_chunk,
-  require_uri, resolve_client_endpoint, send_output, send_publish_end, server_handshake,
-  tcp_connect, write_client_results, write_session_results,
+  FLV_TAG_VIDEO, FlvTagWriter, OUTPUT_QUEUE_CAPACITY, PublishIds, RtmpStream, SessionFailure,
+  WORKER_START_TIMEOUT, WorkerOutput, accept_tls_server, bracketed_host, client_handshake,
+  enhanced_rtmp_capabilities, nanoseconds_timeout, new_client_session, parse_rtmp_uri,
+  publish_event, read_session_chunk, require_uri, resolve_client_endpoint, resolve_tls_acceptor,
+  send_output, send_publish_end, server_handshake, tcp_connect, wrap_tls_client,
+  write_client_results, write_session_results,
 };
 use gst::glib;
 use gst::prelude::*;
@@ -53,6 +54,9 @@ struct Settings {
   keep_listening: bool,
   reconnect: bool,
   tc_url: Option<String>,
+  tls_cert: Option<String>,
+  tls_key: Option<String>,
+  tls_ca_cert: Option<String>,
 }
 
 impl Default for Settings {
@@ -70,6 +74,9 @@ impl Default for Settings {
       keep_listening: DEFAULT_KEEP_LISTENING,
       reconnect: DEFAULT_RECONNECT,
       tc_url: None,
+      tls_cert: None,
+      tls_key: None,
+      tls_ca_cert: None,
     }
   }
 }
@@ -80,6 +87,7 @@ struct ListenEndpoint {
   port: u16,
   app_filter: Option<String>,
   key_filter: Option<String>,
+  tls: bool,
 }
 
 // URI-only: the uri carries host, port, and optional app/key filters. A
@@ -93,6 +101,7 @@ fn resolve_listen_endpoint(settings: &Settings) -> Result<(ListenEndpoint, Strin
       port: parsed.port,
       app_filter: parsed.app,
       key_filter: parsed.stream_key,
+      tls: parsed.tls,
     },
     uri,
   ))
@@ -143,7 +152,7 @@ impl ObjectImpl for RtmpxSrc {
           .build(),
         glib::ParamSpecString::builder("uri")
           .nick("URI")
-          .blurb("RTMP URI. Play (default): rtmp://host:port/app/key. Listen: rtmp://bind-host:port[/app[/key]] (missing app/key accepts any; port 0 allocates one)")
+          .blurb("RTMP URI (rtmp:// or rtmps:// for TLS). Play (default): rtmp(s)://host:port/app/key. Listen: rtmp(s)://bind-host:port[/app[/key]] (missing app/key accepts any; port 0 allocates one; rtmps listen needs tls-cert/tls-key)")
           .mutable_ready()
           .build(),
         glib::ParamSpecBoolean::builder("tcp-nodelay")
@@ -205,6 +214,21 @@ impl ObjectImpl for RtmpxSrc {
           .blurb("Override tcUrl in the RTMP connect (defaults to rtmp://host:port/app)")
           .mutable_ready()
           .build(),
+        glib::ParamSpecString::builder("tls-cert")
+          .nick("TLS certificate")
+          .blurb("Listen mode with an rtmps:// uri: path to the PEM certificate chain file the listener presents")
+          .mutable_ready()
+          .build(),
+        glib::ParamSpecString::builder("tls-key")
+          .nick("TLS private key")
+          .blurb("Listen mode with an rtmps:// uri: path to the PEM private key file matching tls-cert")
+          .mutable_ready()
+          .build(),
+        glib::ParamSpecString::builder("tls-ca-cert")
+          .nick("TLS CA certificate")
+          .blurb("Play mode with an rtmps:// uri: path to an extra PEM CA bundle trusted in addition to the platform store (e.g. a self-signed server certificate)")
+          .mutable_ready()
+          .build(),
       ]
     });
 
@@ -258,6 +282,15 @@ impl ObjectImpl for RtmpxSrc {
       "tc-url" => {
         settings.tc_url = value.get().expect("tc-url type checked upstream");
       }
+      "tls-cert" => {
+        settings.tls_cert = value.get().expect("tls-cert type checked upstream");
+      }
+      "tls-key" => {
+        settings.tls_key = value.get().expect("tls-key type checked upstream");
+      }
+      "tls-ca-cert" => {
+        settings.tls_ca_cert = value.get().expect("tls-ca-cert type checked upstream");
+      }
       _ => unimplemented!(),
     }
   }
@@ -278,6 +311,9 @@ impl ObjectImpl for RtmpxSrc {
       "keep-listening" => settings.keep_listening.to_value(),
       "reconnect" => settings.reconnect.to_value(),
       "tc-url" => settings.tc_url.to_value(),
+      "tls-cert" => settings.tls_cert.to_value(),
+      "tls-key" => settings.tls_key.to_value(),
+      "tls-ca-cert" => settings.tls_ca_cert.to_value(),
       _ => unimplemented!(),
     }
   }
@@ -362,6 +398,13 @@ impl RtmpxSrc {
   fn start_listen(&self, settings: Settings) -> Result<(), gst::ErrorMessage> {
     let (endpoint, uri) = resolve_listen_endpoint(&settings)
       .map_err(|message| gst::error_msg!(gst::ResourceError::Settings, ["{message}"]))?;
+    let tls_acceptor = resolve_tls_acceptor(
+      endpoint.tls,
+      settings.tls_cert.as_deref(),
+      settings.tls_key.as_deref(),
+      "rtmpxsrc listen mode",
+    )
+    .map_err(|message| gst::error_msg!(gst::ResourceError::Settings, ["{message}"]))?;
     let ip_address = endpoint.bind_host.parse::<IpAddr>().map_err(|error| {
       gst::error_msg!(
         gst::ResourceError::Settings,
@@ -408,6 +451,7 @@ impl RtmpxSrc {
       .spawn(move || {
         run_worker(
           listener,
+          tls_acceptor,
           worker_sender,
           worker_cancellation,
           worker_graceful_shutdown,
@@ -453,8 +497,9 @@ impl RtmpxSrc {
           path.push_str(key);
         }
       }
+      let scheme = if endpoint.tls { "rtmps" } else { "rtmp" };
       let resolved = format!(
-        "rtmp://{}:{local_port}{path}",
+        "{scheme}://{}:{local_port}{path}",
         bracketed_host(&endpoint.bind_host)
       );
       self.settings.lock().expect("settings mutex poisoned").uri = Some(resolved);
@@ -716,6 +761,7 @@ impl PushSrcImpl for RtmpxSrc {
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
   listener: TcpListener,
+  tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
   output: flume::Sender<WorkerOutput>,
   cancellation: CancellationToken,
   graceful_shutdown: Arc<AtomicBool>,
@@ -790,6 +836,28 @@ fn run_worker(
         .await;
         return;
       }
+
+      let stream = if let Some(acceptor) = tls_acceptor.as_ref() {
+        let handshake_timeout = nanoseconds_timeout(settings.handshake_timeout);
+        match accept_tls_server(acceptor, stream, &handshake_timeout).await {
+          Ok(tls) => tls,
+          Err(error) => {
+            gst::warning!(
+              CAT,
+              "RTMPS publisher {peer_address}: {error}; continuing to listen"
+            );
+            send_output(
+              &output,
+              &cancellation,
+              WorkerOutput::Warning(format!("RTMPS publisher {peer_address}: {error}")),
+            )
+            .await;
+            continue;
+          }
+        }
+      } else {
+        RtmpStream::Plain(stream)
+      };
 
       gst::info!(
         CAT,
@@ -957,13 +1025,19 @@ async fn connect_and_play(
   let read_timeout = nanoseconds_timeout(settings.read_timeout);
   let handshake_timeout = nanoseconds_timeout(settings.handshake_timeout);
 
-  let mut stream = tcp_connect(
+  let stream = tcp_connect(
     &endpoint.host,
     endpoint.port,
     settings.connect_timeout,
     settings.tcp_nodelay,
   )
   .await?;
+
+  let mut stream = if endpoint.tls {
+    wrap_tls_client(stream, &endpoint.host, settings.tls_ca_cert.as_deref()).await?
+  } else {
+    RtmpStream::Plain(stream)
+  };
 
   gst::info!(
     CAT,
@@ -1050,7 +1124,7 @@ async fn connect_and_play(
 /// the server cleanly ended playback.
 async fn process_client_results(
   session: &mut ClientSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   results: Vec<ClientSessionResult>,
   play: &mut PlaySession,
   output: &flume::Sender<WorkerOutput>,
@@ -1328,7 +1402,7 @@ impl PublishSession {
     stream_name: &str,
     request_id: u32,
     session: &mut ServerSession,
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut RtmpStream,
   ) -> Result<bool, SessionFailure> {
     let app_matches = self
       .application
@@ -1433,7 +1507,7 @@ impl PublishSession {
 /// keeps listening instead of failing (the result is then ignored).
 #[allow(clippy::too_many_arguments)]
 async fn serve_publisher(
-  stream: tokio::net::TcpStream,
+  stream: RtmpStream,
   output: &flume::Sender<WorkerOutput>,
   cancellation: &CancellationToken,
   graceful_shutdown: &Arc<AtomicBool>,
@@ -1521,7 +1595,7 @@ async fn serve_publisher(
 /// when the publisher cleanly finished (unpublished).
 async fn process_session_results(
   session: &mut ServerSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   results: Vec<ServerSessionResult>,
   publish: &mut PublishSession,
   output: &flume::Sender<WorkerOutput>,
@@ -1667,7 +1741,8 @@ mod tests {
     let client = tokio::net::TcpStream::connect(address)
       .await
       .expect("connect must work");
-    let (mut server, _) = listener.accept().await.expect("accept must work");
+    let (server, _) = listener.accept().await.expect("accept must work");
+    let mut server = crate::common::RtmpStream::Plain(server);
     drop(client);
 
     let cancellation = CancellationToken::new();

@@ -36,10 +36,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common::{
   CAT_SINK, ClientEndpoint, FLV_TAG_AUDIO, FLV_TAG_SCRIPT_DATA, FLV_TAG_VIDEO, FlvDemux, FlvTag,
-  SessionFailure, WORKER_START_TIMEOUT, bracketed_host, client_handshake,
-  enhanced_rtmp_capabilities, is_client_io_error, nanoseconds_timeout, new_client_session,
-  parse_rtmp_uri, read_session_chunk, require_uri, resolve_client_endpoint, server_handshake,
-  tcp_connect, write_client_results, write_session_results,
+  RtmpStream, SessionFailure, WORKER_START_TIMEOUT, accept_tls_server, bracketed_host,
+  client_handshake, enhanced_rtmp_capabilities, is_client_io_error, nanoseconds_timeout,
+  new_client_session, parse_rtmp_uri, read_session_chunk, require_uri, resolve_client_endpoint,
+  resolve_tls_acceptor, server_handshake, tcp_connect, wrap_tls_client, write_client_results,
+  write_session_results,
 };
 
 const DEFAULT_MODE: &str = "publish";
@@ -65,6 +66,9 @@ struct Settings {
   handshake_timeout: u64,
   read_timeout: u64,
   write_timeout: u64,
+  tls_cert: Option<String>,
+  tls_key: Option<String>,
+  tls_ca_cert: Option<String>,
 }
 
 impl Default for Settings {
@@ -80,6 +84,9 @@ impl Default for Settings {
       handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
       read_timeout: DEFAULT_READ_TIMEOUT,
       write_timeout: DEFAULT_WRITE_TIMEOUT,
+      tls_cert: None,
+      tls_key: None,
+      tls_ca_cert: None,
     }
   }
 }
@@ -94,6 +101,7 @@ struct ListenEndpoint {
   port: u16,
   app_filter: Option<String>,
   key_filter: Option<String>,
+  tls: bool,
 }
 
 // URI-only: the uri carries the bind host, port, and optional app/key
@@ -107,6 +115,7 @@ fn resolve_listen_endpoint(settings: &Settings) -> Result<(ListenEndpoint, Strin
       port: parsed.port,
       app_filter: parsed.app,
       key_filter: parsed.stream_key,
+      tls: parsed.tls,
     },
     uri,
   ))
@@ -156,7 +165,7 @@ impl ObjectImpl for RtmpxSink {
           .build(),
         glib::ParamSpecString::builder("uri")
           .nick("URI")
-          .blurb("RTMP URI. Publish: rtmp://host:1935/app/key. Listen: rtmp://bind-host:port[/app[/key]] (missing app/key accepts any player; port 0 allocates one)")
+          .blurb("RTMP URI (rtmp:// or rtmps:// for TLS). Publish: rtmp(s)://host:port/app/key. Listen: rtmp(s)://bind-host:port[/app[/key]] (missing app/key accepts any player; port 0 allocates one; rtmps listen needs tls-cert/tls-key)")
           .mutable_ready()
           .build(),
         glib::ParamSpecString::builder("tc-url")
@@ -206,6 +215,21 @@ impl ObjectImpl for RtmpxSink {
           .default_value(DEFAULT_WRITE_TIMEOUT)
           .mutable_ready()
           .build(),
+        glib::ParamSpecString::builder("tls-cert")
+          .nick("TLS certificate")
+          .blurb("Listen mode with an rtmps:// uri: path to the PEM certificate chain file the listener presents")
+          .mutable_ready()
+          .build(),
+        glib::ParamSpecString::builder("tls-key")
+          .nick("TLS private key")
+          .blurb("Listen mode with an rtmps:// uri: path to the PEM private key file matching tls-cert")
+          .mutable_ready()
+          .build(),
+        glib::ParamSpecString::builder("tls-ca-cert")
+          .nick("TLS CA certificate")
+          .blurb("Publish mode with an rtmps:// uri: path to an extra PEM CA bundle trusted in addition to the platform store (e.g. a self-signed server certificate)")
+          .mutable_ready()
+          .build(),
       ]
     });
 
@@ -250,6 +274,15 @@ impl ObjectImpl for RtmpxSink {
       "write-timeout" => {
         settings.write_timeout = value.get().expect("write-timeout type checked upstream");
       }
+      "tls-cert" => {
+        settings.tls_cert = value.get().expect("tls-cert type checked upstream");
+      }
+      "tls-key" => {
+        settings.tls_key = value.get().expect("tls-key type checked upstream");
+      }
+      "tls-ca-cert" => {
+        settings.tls_ca_cert = value.get().expect("tls-ca-cert type checked upstream");
+      }
       _ => unimplemented!(),
     }
   }
@@ -268,6 +301,9 @@ impl ObjectImpl for RtmpxSink {
       "handshake-timeout" => settings.handshake_timeout.to_value(),
       "read-timeout" => settings.read_timeout.to_value(),
       "write-timeout" => settings.write_timeout.to_value(),
+      "tls-cert" => settings.tls_cert.to_value(),
+      "tls-key" => settings.tls_key.to_value(),
+      "tls-ca-cert" => settings.tls_ca_cert.to_value(),
       _ => unimplemented!(),
     }
   }
@@ -516,6 +552,13 @@ impl RtmpxSink {
   fn start_listen(this: &RtmpxSink, settings: Settings) -> Result<(), gst::ErrorMessage> {
     let (endpoint, uri) = resolve_listen_endpoint(&settings)
       .map_err(|message| gst::error_msg!(gst::ResourceError::Settings, ["{message}"]))?;
+    let tls_acceptor = resolve_tls_acceptor(
+      endpoint.tls,
+      settings.tls_cert.as_deref(),
+      settings.tls_key.as_deref(),
+      "rtmpxsink listen mode",
+    )
+    .map_err(|message| gst::error_msg!(gst::ResourceError::Settings, ["{message}"]))?;
     let ip_address = endpoint.bind_host.parse::<IpAddr>().map_err(|error| {
       gst::error_msg!(
         gst::ResourceError::Settings,
@@ -566,6 +609,7 @@ impl RtmpxSink {
       .spawn(move || {
         run_listen_worker(
           listener,
+          tls_acceptor,
           app_filter,
           key_filter,
           settings,
@@ -620,7 +664,11 @@ impl RtmpxSink {
           path.push_str(key);
         }
       }
-      let resolved = format!("rtmp://{}:{local_port}{path}", bracketed_host(&bind_host));
+      let scheme = if endpoint.tls { "rtmps" } else { "rtmp" };
+      let resolved = format!(
+        "{scheme}://{}:{local_port}{path}",
+        bracketed_host(&bind_host)
+      );
       this.settings.lock().expect("settings mutex poisoned").uri = Some(resolved);
       this.obj().notify("uri");
     }
@@ -688,13 +736,18 @@ async fn publish_until_done(
   let write_timeout = nanoseconds_timeout(settings.write_timeout);
   let read_timeout = nanoseconds_timeout(settings.read_timeout);
   let handshake_timeout = nanoseconds_timeout(settings.handshake_timeout);
-  let mut stream = tcp_connect(
+  let stream = tcp_connect(
     &endpoint.host,
     endpoint.port,
     settings.connect_timeout,
     settings.tcp_nodelay,
   )
   .await?;
+  let mut stream = if endpoint.tls {
+    wrap_tls_client(stream, &endpoint.host, settings.tls_ca_cert.as_deref()).await?
+  } else {
+    RtmpStream::Plain(stream)
+  };
   gst::info!(
     CAT_SINK,
     "Connected to RTMP server at {}:{}",
@@ -790,7 +843,7 @@ async fn publish_until_done(
 
 async fn wait_for_connection(
   session: &mut ClientSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   dummy_output: &flume::Sender<crate::common::WorkerOutput>,
   cancellation: &CancellationToken,
   read_timeout: &Option<Duration>,
@@ -824,7 +877,7 @@ async fn wait_for_connection(
 
 async fn drain_connect_results(
   _session: &mut ClientSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   results: Vec<ClientSessionResult>,
   dummy_output: &flume::Sender<crate::common::WorkerOutput>,
   cancellation: &CancellationToken,
@@ -870,7 +923,7 @@ async fn drain_connect_results(
 
 async fn wait_for_publish_accept(
   session: &mut ClientSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   dummy_output: &flume::Sender<crate::common::WorkerOutput>,
   cancellation: &CancellationToken,
   read_timeout: &Option<Duration>,
@@ -960,7 +1013,7 @@ fn publish_flv_tags(
 
 async fn run_publish_loop(
   session: &mut ClientSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   data_receiver: &flume::Receiver<Vec<u8>>,
   dummy_output: &flume::Sender<crate::common::WorkerOutput>,
   cancellation: &CancellationToken,
@@ -1105,6 +1158,7 @@ enum PlayWait {
 #[allow(clippy::too_many_arguments)]
 fn run_listen_worker(
   listener: TcpListener,
+  tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
   app_filter: Option<String>,
   key_filter: Option<String>,
   settings: Settings,
@@ -1143,6 +1197,7 @@ fn run_listen_worker(
     // happens here, as backpressure in render(), like an SRT server sink.
     if let Err(error) = listen_until_done(
       &listener,
+      &tls_acceptor,
       &app_filter,
       &key_filter,
       &settings,
@@ -1163,8 +1218,10 @@ fn run_listen_worker(
 /// that player; the loop keeps listening. Returns Ok on EOS/shutdown and
 /// Err only for fatal listener problems (accept timeout), which render()
 /// surfaces as a sticky failure.
+#[allow(clippy::too_many_arguments)]
 async fn listen_until_done(
   listener: &tokio::net::TcpListener,
+  tls_acceptor: &Option<tokio_rustls::TlsAcceptor>,
   app_filter: &Option<String>,
   key_filter: &Option<String>,
   settings: &Settings,
@@ -1216,6 +1273,19 @@ async fn listen_until_done(
         "failed to configure TCP_NODELAY: {error}"
       )));
     }
+    // A failed TLS handshake ends that player, not the listener: the next
+    // accept still gets its turn.
+    let stream = if let Some(acceptor) = tls_acceptor.as_ref() {
+      match accept_tls_server(acceptor, stream, &handshake_timeout).await {
+        Ok(tls) => tls,
+        Err(error) => {
+          gst::warning!(CAT_SINK, "RTMPS player {peer_address}: {error}");
+          continue;
+        }
+      }
+    } else {
+      RtmpStream::Plain(stream)
+    };
     gst::info!(
       CAT_SINK,
       "Accepted RTMP player connection from {peer_address}"
@@ -1249,7 +1319,7 @@ async fn listen_until_done(
 /// PlayerDone; the listener keeps accepting afterwards.
 #[allow(clippy::too_many_arguments)]
 async fn serve_one_player(
-  stream: tokio::net::TcpStream,
+  stream: RtmpStream,
   app_filter: &Option<String>,
   key_filter: &Option<String>,
   demux: &mut FlvDemux,
@@ -1400,7 +1470,7 @@ async fn serve_one_player(
 #[allow(clippy::too_many_arguments)]
 async fn pump_until_play(
   session: &mut ServerSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   results: Vec<ServerSessionResult>,
   app_filter: &Option<String>,
   key_filter: &Option<String>,
@@ -1543,7 +1613,7 @@ async fn pump_until_play(
 /// Write one server-side media packet with a per-write timeout, mapping
 /// peer-gone errors to disconnects like write_session_results does.
 async fn write_packet_bytes(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   bytes: &[u8],
   write_timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
@@ -1581,7 +1651,7 @@ async fn write_packet_bytes(
 /// Send one cached sequence header to a fresh player.
 async fn send_cached_header(
   session: &mut ServerSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   stream_id: u32,
   tag: &FlvTag,
   write_timeout: &Option<Duration>,
@@ -1615,7 +1685,7 @@ async fn send_cached_header(
 #[allow(clippy::too_many_arguments)]
 async fn stream_to_player(
   session: &mut ServerSession,
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   stream_id: u32,
   demux: &mut FlvDemux,
   headers: &mut HeaderCache,

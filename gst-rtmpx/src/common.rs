@@ -7,8 +7,10 @@
 // implementation.
 
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -16,7 +18,7 @@ use rtmpx::rml_amf0::{Amf0Object, Amf0Value};
 use rtmpx::sessions::{
   ClientSession, ClientSessionConfig, ClientSessionResult, ServerSessionResult,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 pub const FLV_TAG_AUDIO: u8 = 8;
@@ -168,6 +170,7 @@ pub async fn send_publish_end(
 /// plus whether the peer vanished (so keep-listening / reconnect keeps going
 /// instead of failing). A killed peer surfaces as reset/abort/EOF on read or
 /// EPIPE on the next write; read/idle timeouts also count as vanished.
+#[derive(Debug)]
 pub struct SessionFailure {
   pub message: String,
   pub client_disconnect: bool,
@@ -202,7 +205,7 @@ pub struct PublishIds {
 
 /// Run the client-side RTMP handshake, returning trailing non-handshake bytes.
 pub async fn client_handshake(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   cancellation: &CancellationToken,
   handshake_timeout: &Option<Duration>,
 ) -> Result<Vec<u8>, SessionFailure> {
@@ -236,7 +239,7 @@ pub async fn client_handshake(
 /// Run the server-side RTMP handshake with a per-read timeout, returning any
 /// trailing non-handshake bytes for the session.
 pub async fn server_handshake(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   cancellation: &CancellationToken,
   handshake_timeout: &Option<Duration>,
 ) -> Result<Vec<u8>, SessionFailure> {
@@ -252,7 +255,7 @@ pub async fn server_handshake(
 }
 
 async fn handshake_loop(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   cancellation: &CancellationToken,
   handshake_timeout: &Option<Duration>,
   mut handshake: Handshake,
@@ -319,7 +322,7 @@ async fn handshake_loop(
 }
 
 async fn write_handshake_response(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   response_bytes: &[u8],
   peer_label: &str,
 ) -> Result<(), SessionFailure> {
@@ -341,7 +344,7 @@ async fn write_handshake_response(
 
 /// Write outbound client session packets with a per-write timeout.
 pub async fn write_client_results(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   results: Vec<ClientSessionResult>,
   _output: &flume::Sender<WorkerOutput>,
   _cancellation: &CancellationToken,
@@ -389,7 +392,7 @@ pub async fn write_client_results(
 
 /// Write outbound server session packets with a per-write timeout.
 pub async fn write_session_results(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   results: Vec<ServerSessionResult>,
   _output: &flume::Sender<WorkerOutput>,
   _cancellation: &CancellationToken,
@@ -441,19 +444,28 @@ pub struct RtmpEndpoint {
   pub port: u16,
   pub app: Option<String>,
   pub stream_key: Option<String>,
+  /// True for rtmps:// (RTMP over TLS). Decided by the URI scheme only.
+  pub tls: bool,
 }
 
-// Parse rtmp://host[:port][/app[/stream-key...]]. The scheme must be rtmp.
+// Parse rtmp(s)://host[:port][/app[/stream-key...]]. The scheme decides the
+// transport: rtmp is plain TCP, rtmps is RTMP over TLS.
 // The host may be a DNS name, an IPv4 literal, or a bracketed IPv6 literal
-// such as [::]. The port defaults to 1935 (0 is allowed so a listener can
-// ask the OS for a free port). The app is the first path segment; the
-// stream key is everything after it and may itself contain slashes.
+// such as [::]. The port defaults to 1935 (443 for rtmps); 0 is allowed so
+// a listener can ask the OS for a free port. The app is the first path
+// segment; the stream key is everything after it and may itself contain
+// slashes.
 // Missing app/key means "no constraint" for a listener; play/publish
 // callers must reject that via require_app_key. Query strings are ignored.
 pub fn parse_rtmp_uri(uri: &str) -> Result<RtmpEndpoint, String> {
-  let rest = uri
-    .strip_prefix("rtmp://")
-    .ok_or_else(|| "RTMP URI must start with rtmp://".to_string())?;
+  let (rest, tls) = if let Some(rest) = uri.strip_prefix("rtmp://") {
+    (rest, false)
+  } else if let Some(rest) = uri.strip_prefix("rtmps://") {
+    (rest, true)
+  } else {
+    return Err("RTMP URI must start with rtmp:// or rtmps://".to_string());
+  };
+  let default_port = if tls { 443 } else { 1935 };
   let (authority, path) = match rest.find('/') {
     Some(index) => (&rest[..index], &rest[index + 1..]),
     None => (rest, ""),
@@ -461,7 +473,7 @@ pub fn parse_rtmp_uri(uri: &str) -> Result<RtmpEndpoint, String> {
   if authority.is_empty() {
     return Err("RTMP URI must contain a host".to_string());
   }
-  let (host, port) = parse_authority(authority)?;
+  let (host, port) = parse_authority(authority, default_port)?;
   let path = match path.find('?') {
     Some(index) => &path[..index],
     None => path,
@@ -482,10 +494,11 @@ pub fn parse_rtmp_uri(uri: &str) -> Result<RtmpEndpoint, String> {
     port,
     app,
     stream_key,
+    tls,
   })
 }
 
-fn parse_authority(authority: &str) -> Result<(String, u16), String> {
+fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), String> {
   if let Some(rest) = authority.strip_prefix('[') {
     let (host, rest) = rest
       .split_once(']')
@@ -494,7 +507,7 @@ fn parse_authority(authority: &str) -> Result<(String, u16), String> {
       return Err("RTMP URI must contain a host".to_string());
     }
     if rest.is_empty() {
-      return Ok((host.to_owned(), 1935));
+      return Ok((host.to_owned(), default_port));
     }
     let port = rest
       .strip_prefix(':')
@@ -518,16 +531,17 @@ fn parse_authority(authority: &str) -> Result<(String, u16), String> {
         .map_err(|_| "RTMP URI has an invalid port".to_string())?;
       Ok((host.to_owned(), port))
     }
-    None => Ok((authority.to_owned(), 1935)),
+    None => Ok((authority.to_owned(), default_port)),
   }
 }
 
 /// Default tcUrl for a connect: scheme + host + port + app, never the key.
-pub fn default_tc_url(host: &str, port: u16, app: &str) -> String {
+pub fn default_tc_url(host: &str, port: u16, app: &str, tls: bool) -> String {
+  let scheme = if tls { "rtmps" } else { "rtmp" };
   if host.contains(':') {
-    format!("rtmp://[{host}]:{port}/{app}")
+    format!("{scheme}://[{host}]:{port}/{app}")
   } else {
-    format!("rtmp://{host}:{port}/{app}")
+    format!("{scheme}://{host}:{port}/{app}")
   }
 }
 
@@ -552,6 +566,7 @@ pub struct ClientEndpoint {
   pub app: String,
   pub stream_key: String,
   pub tc_url: String,
+  pub tls: bool,
 }
 
 pub fn require_uri(uri: &Option<String>, what: &str) -> Result<String, String> {
@@ -579,13 +594,14 @@ pub fn resolve_client_endpoint(
   let (app, stream_key) = require_app_key(&parsed, what)?;
   let tc_url = tc_url
     .filter(|url| !url.is_empty())
-    .unwrap_or_else(|| default_tc_url(&parsed.host, parsed.port, &app));
+    .unwrap_or_else(|| default_tc_url(&parsed.host, parsed.port, &app, parsed.tls));
   Ok(ClientEndpoint {
     host: parsed.host,
     port: parsed.port,
     app,
     stream_key,
     tc_url,
+    tls: parsed.tls,
   })
 }
 
@@ -627,6 +643,202 @@ pub async fn tcp_connect(
   Ok(stream)
 }
 
+/// One RTMP byte stream: plain TCP, or TLS over TCP as an rtmps:// client
+/// or listener. The RTMP handshake and session drivers only need
+/// AsyncRead + AsyncWrite, so every layer above this enum is transport
+/// agnostic; the URI scheme decides which variant is built.
+pub enum RtmpStream {
+  Plain(tokio::net::TcpStream),
+  TlsClient(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+  TlsServer(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
+}
+
+impl AsyncRead for RtmpStream {
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+  ) -> Poll<io::Result<()>> {
+    match self.get_mut() {
+      RtmpStream::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+      RtmpStream::TlsClient(stream) => Pin::new(stream).poll_read(cx, buf),
+      RtmpStream::TlsServer(stream) => Pin::new(stream).poll_read(cx, buf),
+    }
+  }
+}
+
+impl AsyncWrite for RtmpStream {
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    match self.get_mut() {
+      RtmpStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+      RtmpStream::TlsClient(stream) => Pin::new(stream).poll_write(cx, buf),
+      RtmpStream::TlsServer(stream) => Pin::new(stream).poll_write(cx, buf),
+    }
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    match self.get_mut() {
+      RtmpStream::Plain(stream) => Pin::new(stream).poll_flush(cx),
+      RtmpStream::TlsClient(stream) => Pin::new(stream).poll_flush(cx),
+      RtmpStream::TlsServer(stream) => Pin::new(stream).poll_flush(cx),
+    }
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    match self.get_mut() {
+      RtmpStream::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+      RtmpStream::TlsClient(stream) => Pin::new(stream).poll_shutdown(cx),
+      RtmpStream::TlsServer(stream) => Pin::new(stream).poll_shutdown(cx),
+    }
+  }
+}
+
+fn read_pem_file(path: &str, what: &str) -> Result<Vec<u8>, String> {
+  std::fs::read(path).map_err(|error| format!("Failed to read {what} file '{path}': {error}"))
+}
+
+/// rustls client config: the platform trust store plus one optional extra
+/// PEM bundle (tls-ca-cert), which is how self-signed or private-CA servers
+/// are trusted without touching the system store.
+pub fn build_tls_client_config(ca_cert_file: Option<&str>) -> Result<rustls::ClientConfig, String> {
+  let mut roots = rustls::RootCertStore::empty();
+  let native = rustls_native_certs::load_native_certs();
+  if !native.errors.is_empty() {
+    gst::warning!(
+      CAT_SRC,
+      "TLS trust store load reported {} error(s); first: {}",
+      native.errors.len(),
+      native.errors[0],
+    );
+  }
+  let (added, ignored) = roots.add_parsable_certificates(native.certs);
+  if ignored > 0 {
+    gst::warning!(
+      CAT_SRC,
+      "Ignored {ignored} unparsable certificate(s) from the platform TLS trust store ({added} loaded)"
+    );
+  }
+  if let Some(path) = ca_cert_file.filter(|path| !path.is_empty()) {
+    let pem = read_pem_file(path, "TLS CA certificate")?;
+    let mut reader = pem.as_slice();
+    let certs: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(&mut reader)
+      .collect::<Result<Vec<_>, _>>()
+      .map_err(|error| format!("Failed to parse TLS CA certificate file '{path}': {error}"))?;
+    if certs.is_empty() {
+      return Err(format!(
+        "TLS CA certificate file '{path}' contains no certificates"
+      ));
+    }
+    let (added, ignored) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+      return Err(format!(
+        "TLS CA certificate file '{path}' contains no usable certificates ({ignored} ignored)"
+      ));
+    }
+  }
+  Ok(
+    rustls::ClientConfig::builder()
+      .with_root_certificates(roots)
+      .with_no_client_auth(),
+  )
+}
+
+/// Wrap a connected TCP stream in a TLS client session for an rtmps://
+/// server. SNI comes from the URI host (DNS name or IP literal); the
+/// certificate is verified against the platform store + tls-ca-cert.
+pub async fn wrap_tls_client(
+  stream: tokio::net::TcpStream,
+  host: &str,
+  ca_cert_file: Option<&str>,
+) -> Result<RtmpStream, SessionFailure> {
+  let config = build_tls_client_config(ca_cert_file)
+    .map_err(|message| SessionFailure::error(format!("TLS setup failed: {message}")))?;
+  let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+  let server_name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|_| {
+    SessionFailure::error(format!("TLS setup failed: invalid server name '{host}'"))
+  })?;
+  let tls = connector
+    .connect(server_name, stream)
+    .await
+    .map_err(|error| {
+      SessionFailure::disconnect(format!("TLS handshake with RTMP server failed: {error}"))
+    })?;
+  Ok(RtmpStream::TlsClient(tls))
+}
+
+/// rustls server config for an rtmps:// listener from a PEM certificate
+/// chain (tls-cert) plus its PEM private key (tls-key, PKCS#8/RSA/SEC1).
+/// No client authentication: any publisher/player may connect, exactly
+/// like a plain rtmp:// listener.
+pub fn build_tls_acceptor(
+  cert_file: &str,
+  key_file: &str,
+) -> Result<tokio_rustls::TlsAcceptor, String> {
+  let cert_pem = read_pem_file(cert_file, "TLS certificate")?;
+  let mut cert_reader = cert_pem.as_slice();
+  let certs: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(&mut cert_reader)
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| format!("Failed to parse TLS certificate file '{cert_file}': {error}"))?;
+  if certs.is_empty() {
+    return Err(format!(
+      "TLS certificate file '{cert_file}' contains no certificates"
+    ));
+  }
+  let key_pem = read_pem_file(key_file, "TLS private key")?;
+  let mut key_reader = key_pem.as_slice();
+  let key = rustls_pemfile::private_key(&mut key_reader)
+    .map_err(|error| format!("Failed to parse TLS private key file '{key_file}': {error}"))?
+    .ok_or_else(|| format!("TLS private key file '{key_file}' contains no private key"))?;
+  let config = rustls::ServerConfig::builder()
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|error| format!("Invalid TLS certificate/key pair: {error}"))?;
+  Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config)))
+}
+
+/// Run the TLS server handshake on an accepted TCP connection for an
+/// rtmps:// listener, with the same per-read timeout semantics as the RTMP
+/// handshake that follows it.
+pub async fn accept_tls_server(
+  acceptor: &tokio_rustls::TlsAcceptor,
+  stream: tokio::net::TcpStream,
+  handshake_timeout: &Option<Duration>,
+) -> Result<RtmpStream, String> {
+  let accept = acceptor.accept(stream);
+  let tls = if let Some(limit) = handshake_timeout {
+    tokio::time::timeout(*limit, accept)
+      .await
+      .map_err(|_| format!("timed out after {limit:?} waiting for the TLS handshake"))?
+      .map_err(|error| format!("TLS handshake failed: {error}"))?
+  } else {
+    accept
+      .await
+      .map_err(|error| format!("TLS handshake failed: {error}"))?
+  };
+  Ok(RtmpStream::TlsServer(tls))
+}
+
+/// Build the TLS acceptor for an rtmps:// listener, or None for plain
+/// rtmp://. Missing tls-cert/tls-key files are a settings error so the
+/// element fails to start instead of listening unencrypted.
+pub fn resolve_tls_acceptor(
+  tls: bool,
+  cert_file: Option<&str>,
+  key_file: Option<&str>,
+  what: &str,
+) -> Result<Option<tokio_rustls::TlsAcceptor>, String> {
+  if !tls {
+    return Ok(None);
+  }
+  let cert = cert_file.filter(|path| !path.is_empty()).ok_or_else(|| {
+    format!("{what} uses an rtmps:// uri and needs tls-cert (PEM certificate chain)")
+  })?;
+  let key = key_file
+    .filter(|path| !path.is_empty())
+    .ok_or_else(|| format!("{what} uses an rtmps:// uri and needs tls-key (PEM private key)"))?;
+  build_tls_acceptor(cert, key).map(Some)
+}
+
 /// Fresh client session with the window/chunk sizes both elements use, plus
 /// the tcUrl for this connection.
 pub fn new_client_session(tc_url: String) -> Result<ClientSession, SessionFailure> {
@@ -644,7 +856,7 @@ pub fn new_client_session(tc_url: String) -> Result<ClientSession, SessionFailur
 /// client and server session read loop so EOF/timeout/peer-gone mapping
 /// stays identical everywhere.
 pub async fn read_session_chunk(
-  stream: &mut tokio::net::TcpStream,
+  stream: &mut RtmpStream,
   buf: &mut [u8],
   cancellation: &CancellationToken,
   read_timeout: &Option<Duration>,
@@ -830,12 +1042,30 @@ mod tests {
     assert_eq!(endpoint.port, 1945);
     assert_eq!(endpoint.app.as_deref(), Some("live"));
     assert_eq!(endpoint.stream_key.as_deref(), Some("nested/key"));
+    assert!(!endpoint.tls);
   }
 
   #[test]
   fn parses_uri_with_default_port() {
     let endpoint = parse_rtmp_uri("rtmp://127.0.0.1/live/test").unwrap();
     assert_eq!(endpoint.port, 1935);
+    assert!(!endpoint.tls);
+  }
+
+  #[test]
+  fn parses_rtmps_uri_with_tls_and_443_default() {
+    let endpoint = parse_rtmp_uri("rtmps://example.com/live/test").unwrap();
+    assert_eq!(endpoint.host, "example.com");
+    assert_eq!(endpoint.port, 443);
+    assert_eq!(endpoint.app.as_deref(), Some("live"));
+    assert_eq!(endpoint.stream_key.as_deref(), Some("test"));
+    assert!(endpoint.tls);
+    let endpoint = parse_rtmp_uri("rtmps://example.com:8443/live").unwrap();
+    assert_eq!(endpoint.port, 8443);
+    assert!(endpoint.tls);
+    let endpoint = parse_rtmp_uri("rtmps://127.0.0.1:0/live").unwrap();
+    assert_eq!(endpoint.port, 0);
+    assert!(endpoint.tls);
   }
 
   #[test]
@@ -852,7 +1082,7 @@ mod tests {
 
   #[test]
   fn rejects_non_rtmp_scheme_and_bad_authority() {
-    assert!(parse_rtmp_uri("rtmps://host/live/key").is_err());
+    assert!(parse_rtmp_uri("http://host/live/key").is_err());
     assert!(parse_rtmp_uri("rtmp://:1935/live/key").is_err());
     assert!(parse_rtmp_uri("rtmp://::1/live/key").is_err());
     let endpoint = parse_rtmp_uri("rtmp://host/app-only").unwrap();
@@ -880,6 +1110,20 @@ mod tests {
     assert_eq!(endpoint.app, "live");
     assert_eq!(endpoint.stream_key, "nested/key");
     assert_eq!(endpoint.tc_url, "rtmp://example.com:1945/live");
+    assert!(!endpoint.tls);
+  }
+
+  #[test]
+  fn client_endpoint_keeps_rtmps_scheme_in_tc_url() {
+    let endpoint = resolve_client_endpoint(
+      Some("rtmps://example.com/live/nested/key".into()),
+      None,
+      "rtmpxsrc",
+    )
+    .unwrap();
+    assert_eq!(endpoint.port, 443);
+    assert_eq!(endpoint.tc_url, "rtmps://example.com:443/live");
+    assert!(endpoint.tls);
   }
 
   #[test]
@@ -887,6 +1131,95 @@ mod tests {
     assert!(resolve_client_endpoint(Some("rtmp://host/".into()), None, "play").is_err());
     assert!(resolve_client_endpoint(Some("rtmp://host/app-only".into()), None, "play").is_err());
     assert!(resolve_client_endpoint(None, None, "play").is_err());
+  }
+
+  #[test]
+  fn tls_builders_reject_missing_files() {
+    assert!(build_tls_acceptor("/nonexistent/cert.pem", "/nonexistent/key.pem").is_err());
+    assert!(build_tls_client_config(Some("/nonexistent/ca.pem")).is_err());
+    // A client config without extras still builds (platform trust store).
+    assert!(build_tls_client_config(None).is_ok());
+  }
+
+  /// Self-signed roundtrip: TLS acceptor + TLS client over loopback TCP,
+  /// then the plain RTMP handshake both ways through the TLS streams.
+  #[test]
+  fn tls_roundtrip_completes_rtmp_handshake() {
+    let certified =
+      rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+        .expect("test certificate must generate");
+    let dir = std::env::temp_dir();
+    let tag = format!("rtmpx-tls-{}", std::process::id());
+    let cert_path = dir.join(format!("{tag}-cert.pem"));
+    let key_path = dir.join(format!("{tag}-key.pem"));
+    std::fs::write(&cert_path, certified.cert.pem()).expect("cert must write");
+    std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("key must write");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime must build");
+    let cert_str = cert_path.to_str().unwrap().to_owned();
+    let key_str = key_path.to_str().unwrap().to_owned();
+    runtime.block_on(async move {
+      let acceptor = build_tls_acceptor(&cert_str, &key_str)
+        .expect("acceptor must build from the test certificate");
+      let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener must bind");
+      let address = listener
+        .local_addr()
+        .expect("listener must have an address");
+
+      let server = async move {
+        let (tcp, _) = listener.accept().await.expect("server must accept TCP");
+        let mut stream = accept_tls_server(&acceptor, tcp, &None)
+          .await
+          .expect("server TLS handshake must complete");
+        let trailing = server_handshake(&mut stream, &CancellationToken::new(), &None)
+          .await
+          .expect("server RTMP handshake must complete");
+        // Prove the stream is usable after the handshake. The client's
+        // post-handshake byte may already sit in `trailing` (TLS coalesces
+        // it with the handshake tail), so accept either arrival order.
+        if trailing == vec![0x42] {
+          return;
+        }
+        assert!(
+          trailing.is_empty(),
+          "server handshake must leave no unexpected trailing bytes: {trailing:?}"
+        );
+        let mut byte = [0u8; 1];
+        use tokio::io::AsyncReadExt;
+        stream
+          .read_exact(&mut byte)
+          .await
+          .expect("server must read");
+        assert_eq!(byte, [0x42]);
+      };
+      let ca = cert_str.clone();
+      let client = async move {
+        let tcp = tokio::net::TcpStream::connect(address)
+          .await
+          .expect("client must connect");
+        let mut stream = wrap_tls_client(tcp, "127.0.0.1", Some(ca.as_str()))
+          .await
+          .expect("client TLS handshake must complete");
+        let trailing = client_handshake(&mut stream, &CancellationToken::new(), &None)
+          .await
+          .expect("client RTMP handshake must complete");
+        assert!(trailing.is_empty());
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(&[0x42]).await.expect("client must write");
+        stream.flush().await.expect("client must flush");
+      };
+      let (server_done, client_done) = tokio::join!(tokio::spawn(server), tokio::spawn(client));
+      server_done.expect("server task must finish");
+      client_done.expect("client task must finish");
+    });
+
+    std::fs::remove_file(&cert_path).ok();
+    std::fs::remove_file(&key_path).ok();
   }
 
   #[test]

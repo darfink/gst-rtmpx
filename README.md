@@ -18,6 +18,13 @@ Both elements can act as a listener: `rtmpxsrc` accepts incoming publisher
 connections directly, and `rtmpxsink` waits for and serves incoming player
 connections — no separate server element needed.
 
+Both also speak encrypted RTMP (RTMPS): use an `rtmps://` URI and the scheme
+selects TLS. Clients verify the server against the platform trust store plus
+`tls-ca-cert`; listeners present the `tls-cert` / `tls-key` pair.
+
+Both elements advertise Enhanced RTMP, so modern encoders and servers keep
+negotiating HEVC/AV1/multitrack alongside classic H264/AAC.
+
 | Element | Direction | Purpose |
 | --- | --- | --- |
 | `rtmpxsrc` | source | Receive an RTMP stream: listen for a publisher, or play from a server |
@@ -55,6 +62,17 @@ gst-launch-1.0 -e rtmpxsrc mode=listen uri=rtmp://0.0.0.0:1935/live ! flvdemux !
 
 ```sh
 gst-launch-1.0 -e videotestsrc ! x264enc tune=zerolatency ! flvmux ! rtmpxsink mode=listen uri=rtmp://0.0.0.0:1935/live/test
+```
+
+## Encrypted RTMP (RTMPS)
+
+Use `rtmps://` instead of `rtmp://` and the element negotiates TLS before the
+RTMP handshake. A listener needs a certificate and key; a client trusts the
+platform store, with `tls-ca-cert` as an override for private or self-signed CAs:
+
+```sh
+gst-launch-1.0 -e rtmpxsrc mode=listen uri=rtmps://0.0.0.0:1935/live tls-cert=/etc/rtmpx/cert.pem tls-key=/etc/rtmpx/key.pem ! flvdemux ! fakesink
+gst-launch-1.0 -e rtmpxsrc uri=rtmps://example.com:443/live/test tls-ca-cert=/etc/rtmpx/ca.pem ! flvdemux ! fakesink
 ```
 
 ## Build
