@@ -2,8 +2,8 @@
 // The sink binds and serves raw RTMP players, applying backpressure
 // until one connects. No ffmpeg or external server is used.
 use gst::prelude::*;
+use rtmpx::amf0::{Amf0Object, Amf0Value};
 use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::rml_amf0::{Amf0Object, Amf0Value};
 use rtmpx::sessions::{
   ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
 };
@@ -281,7 +281,7 @@ fn sink_listen_rejects_wrong_stream_key_and_keeps_serving() {
   assert!(
     denied.transcript.contains("Failed")
       || denied.transcript.contains("closed")
-      || denied.transcript.contains("Unhandleable"),
+      || denied.transcript.contains("Rejected"),
     "server must reject or hang up"
   );
   let vseq = vec![0x17, 0x00, 0x11];
@@ -574,19 +574,23 @@ fn run_player_blocking(
         for result in results {
           let _ = writeln!(transcript, "{:?}", result);
           match result {
-            ClientSessionResult::RaisedEvent(ClientSessionEvent::PlaybackRequestAccepted) => {
+            ClientSessionResult::RaisedEvent(ClientSessionEvent::PlaybackRequestAccepted {
+              ..
+            }) => {
               accepted = true;
               notify_ready(true, &ready, &mut notified);
             }
             ClientSessionResult::RaisedEvent(ClientSessionEvent::VideoDataReceived {
               timestamp,
               data,
+              ..
             }) => {
               videos.push((timestamp.value, data.to_vec()));
             }
             ClientSessionResult::RaisedEvent(ClientSessionEvent::AudioDataReceived {
               timestamp,
               data,
+              ..
             }) => {
               audios.push((timestamp.value, data.to_vec()));
             }

@@ -20,8 +20,8 @@ use gst_base::prelude::*;
 use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
 use rtmpx::sessions::{
-  ClientSession, ClientSessionEvent, ClientSessionResult, ServerSession, ServerSessionConfig,
-  ServerSessionEvent, ServerSessionResult,
+  ClientSession, ClientSessionEvent, ClientSessionResult, RequestId, ServerSession,
+  ServerSessionConfig, ServerSessionEvent, ServerSessionResult, StreamId,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -1161,12 +1161,12 @@ async fn process_client_results(
           gst::info!(CAT, "RTMP server accepted connection");
           play_requested = true;
         }
-        ClientSessionEvent::ConnectionRequestRejected { description } => {
+        ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
           return Err(SessionFailure::error(format!(
             "RTMP server rejected connection: {description}"
           )));
         }
-        ClientSessionEvent::PlaybackRequestAccepted => {
+        ClientSessionEvent::PlaybackRequestAccepted { .. } => {
           let connection_id = play.next_connection_id.fetch_add(1, Ordering::Relaxed);
           play.connection_id.store(connection_id, Ordering::Release);
           gst::info!(CAT, "RTMP server accepted playback");
@@ -1183,34 +1183,48 @@ async fn process_client_results(
             return Err(SessionFailure::error("listener is shutting down"));
           }
         }
-        ClientSessionEvent::VideoDataReceived { data, timestamp } => {
+        ClientSessionEvent::VideoDataReceived {
+          data, timestamp, ..
+        } => {
           play.on_media(FLV_TAG_VIDEO, timestamp.value, &data).await?;
         }
-        ClientSessionEvent::AudioDataReceived { data, timestamp } => {
+        ClientSessionEvent::AudioDataReceived {
+          data, timestamp, ..
+        } => {
           play.on_media(FLV_TAG_AUDIO, timestamp.value, &data).await?;
         }
-        ClientSessionEvent::StreamMetadataReceived {
-          raw_payload,
-          timestamp,
-          ..
-        } => {
+        ClientSessionEvent::StreamMetadataReceived { message, .. } => {
           play
-            .on_media(FLV_TAG_SCRIPT_DATA, timestamp.value, &raw_payload)
+            .on_media(
+              FLV_TAG_SCRIPT_DATA,
+              message.timestamp().value,
+              &message.into_payload(),
+            )
             .await?;
         }
-        ClientSessionEvent::UnhandleableOnStatusCode { code } => {
-          if code == "NetStream.Play.Stop"
-            || code == "NetStream.Play.UnpublishNotify"
-            || code == "NetStream.Play.Complete"
-          {
-            gst::info!(CAT, "RTMP server ended playback ({code})");
+        ClientSessionEvent::PlaybackFinished { status, .. } => {
+          gst::info!(
+            CAT,
+            "RTMP server ended playback ({})",
+            status.code().unwrap_or("unknown")
+          );
+          return Ok(false);
+        }
+        ClientSessionEvent::StatusReceived { status, .. } => {
+          if status.code() == Some("NetStream.Play.UnpublishNotify") {
+            gst::info!(CAT, "RTMP server unpublished the played stream");
             return Ok(false);
           }
-          gst::debug!(CAT, "Ignoring RTMP onStatus {code}");
+          gst::debug!(
+            CAT,
+            "Ignoring RTMP onStatus {}",
+            status.code().unwrap_or("unknown")
+          );
         }
         _ => {}
       },
       ClientSessionResult::UnhandleableMessageReceived(_) => {}
+      _ => {}
     }
   }
   if play_requested {
@@ -1405,10 +1419,10 @@ impl PublishSession {
   /// filter. Returns true when the publisher may proceed.
   async fn check_publish(
     &mut self,
-    stream_id: u32,
+    stream_id: StreamId,
     app_name: &str,
     stream_name: &str,
-    request_id: u32,
+    request_id: RequestId,
     session: &mut ServerSession,
     stream: &mut RtmpStream,
   ) -> Result<bool, SessionFailure> {
@@ -1673,22 +1687,22 @@ async fn process_session_results(
             .on_media(FLV_TAG_VIDEO, timestamp.value, &data)
             .await?;
         }
-        ServerSessionEvent::StreamMetadataChanged {
-          raw_payload,
-          timestamp,
-          ..
-        } => {
+        ServerSessionEvent::StreamMetadataChanged { message, .. } => {
           publish
-            .on_media(FLV_TAG_SCRIPT_DATA, timestamp.value, &raw_payload)
+            .on_media(
+              FLV_TAG_SCRIPT_DATA,
+              message.timestamp().value,
+              &message.into_payload(),
+            )
             .await?;
         }
-        ServerSessionEvent::StreamDataReceived {
-          raw_payload,
-          timestamp,
-          ..
-        } => {
+        ServerSessionEvent::StreamDataReceived { message, .. } => {
           publish
-            .on_media(FLV_TAG_SCRIPT_DATA, timestamp.value, &raw_payload)
+            .on_media(
+              FLV_TAG_SCRIPT_DATA,
+              message.timestamp().value,
+              &message.into_payload(),
+            )
             .await?;
         }
         ServerSessionEvent::PublishStreamFinished { stream_key, .. } => {
@@ -1725,6 +1739,7 @@ async fn process_session_results(
         _ => {}
       },
       ServerSessionResult::UnhandleableMessageReceived(_) => {}
+      _ => {}
     }
   }
   Ok(true)

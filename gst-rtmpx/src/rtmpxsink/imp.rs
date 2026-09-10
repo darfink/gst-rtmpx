@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use rtmpx::sessions::{
-  ClientSession, ClientSessionEvent, ClientSessionResult, PublishRequestType, ServerSession,
-  ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
+  ClientSession, ClientSessionEvent, ClientSessionResult, DataMessage, DataMessageType,
+  PublishRequestType, ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
+  StreamId,
 };
 use rtmpx::time::RtmpTimestamp;
 
@@ -916,7 +917,7 @@ async fn drain_connect_results(
           gst::info!(CAT_SINK, "RTMP server accepted connection");
           accepted = true;
         }
-        ClientSessionEvent::ConnectionRequestRejected { description } => {
+        ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
           return Err(SessionFailure::error(format!(
             "RTMP server rejected connection: {description}"
           )));
@@ -924,6 +925,7 @@ async fn drain_connect_results(
         _ => {}
       },
       ClientSessionResult::UnhandleableMessageReceived(_) => {}
+      _ => {}
     }
   }
   Ok(accepted)
@@ -965,8 +967,8 @@ async fn wait_for_publish_accept(
           .await?;
         }
         ClientSessionResult::RaisedEvent(event) => match event {
-          ClientSessionEvent::PublishRequestAccepted => accepted = true,
-          ClientSessionEvent::ConnectionRequestRejected { description } => {
+          ClientSessionEvent::PublishRequestAccepted { .. } => accepted = true,
+          ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
             return Err(SessionFailure::error(format!(
               "RTMP server rejected publish: {description}"
             )));
@@ -974,6 +976,7 @@ async fn wait_for_publish_accept(
           _ => {}
         },
         ClientSessionResult::UnhandleableMessageReceived(_) => {}
+        _ => {}
       }
     }
     if accepted {
@@ -1005,7 +1008,11 @@ fn publish_flv_tags(
           SessionFailure::error(format!("failed to publish video data: {error:?}"))
         })?,
       FLV_TAG_SCRIPT_DATA => session
-        .publish_raw_data_payload(Bytes::from(tag.payload), timestamp)
+        .publish_data(DataMessage::new(
+          DataMessageType::Amf0,
+          timestamp,
+          Bytes::from(tag.payload),
+        ))
         .map_err(|error| {
           SessionFailure::error(format!("failed to publish script data: {error:?}"))
         })?,
@@ -1081,6 +1088,7 @@ async fn run_publish_loop(
               gst::debug!(CAT_SINK, "Ignoring RTMP client event while publishing: {event:?}");
             }
             ClientSessionResult::UnhandleableMessageReceived(_) => {}
+      _ => {}
           }
         }
       }
@@ -1157,7 +1165,7 @@ enum PlayerOutcome {
 
 /// What the pre-play pump found in one batch of session results.
 enum PlayWait {
-  Accepted(u32),
+  Accepted(StreamId),
   Rejected,
   NeedMore,
   Gone,
@@ -1613,6 +1621,7 @@ async fn pump_until_play(
         _ => {}
       },
       ServerSessionResult::UnhandleableMessageReceived(_) => {}
+      _ => {}
     }
   }
   PlayWait::NeedMore
@@ -1660,7 +1669,7 @@ async fn write_packet_bytes(
 async fn send_cached_header(
   session: &mut ServerSession,
   stream: &mut RtmpStream,
-  stream_id: u32,
+  stream_id: StreamId,
   tag: &FlvTag,
   write_timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
@@ -1694,7 +1703,7 @@ async fn send_cached_header(
 async fn stream_to_player(
   session: &mut ServerSession,
   stream: &mut RtmpStream,
-  stream_id: u32,
+  stream_id: StreamId,
   demux: &mut FlvDemux,
   headers: &mut HeaderCache,
   data_receiver: &flume::Receiver<Vec<u8>>,
@@ -1839,11 +1848,12 @@ async fn stream_to_player(
                 return PlayerOutcome::PlayerDone;
               }
             }
-            ServerSessionResult::RaisedEvent(event) => if let ServerSessionEvent::PlayStreamFinished { stream_key, .. } = event {
+            ServerSessionResult::RaisedEvent(ServerSessionEvent::PlayStreamFinished { stream_key, .. }) => {
               gst::info!(CAT_SINK, "RTMP player stopped playing '{stream_key}'");
               player_over = true;
-            },
+            }
             ServerSessionResult::UnhandleableMessageReceived(_) => {}
+      _ => {}
           }
         }
         if player_over {

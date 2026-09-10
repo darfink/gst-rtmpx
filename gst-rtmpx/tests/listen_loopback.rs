@@ -9,8 +9,8 @@ use gst::prelude::*;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use rtmpx::amf0::{Amf0Object, Amf0Value};
 use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::rml_amf0::{Amf0Object, Amf0Value};
 use rtmpx::sessions::{
   ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 };
@@ -395,7 +395,7 @@ fn probe_publish(port: u16, key: &str) -> String {
         for result in results {
           if matches!(
             result,
-            ClientSessionResult::RaisedEvent(ClientSessionEvent::PublishRequestAccepted)
+            ClientSessionResult::RaisedEvent(ClientSessionEvent::PublishRequestAccepted { .. })
           ) {
             panic!("server accepted publish for an unexpected key");
           }
