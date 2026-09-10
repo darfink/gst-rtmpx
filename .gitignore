@@ -1,0 +1,10 @@
+/target/
+**/target/
+*.dylib
+*.so
+*.dll
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
