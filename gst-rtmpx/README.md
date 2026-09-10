@@ -1,40 +1,72 @@
 ## gst-rtmpx — RTMP source / sink on rtmpx (URI-only)
 
-Both elements double as a listener: `rtmpxsrc` accepts incoming publisher
-connections, and `rtmpxsink` waits for and serves incoming player
-connections — no separate server element needed.
+Both elements default to client behaviour (like `rtmp2src` / `rtmp2sink`) and
+can opt into listening with `mode=listen`: `rtmpxsrc` accepts incoming publisher
+connections, and `rtmpxsink` waits for and serves incoming player connections
+— no separate server element needed.
 
-`rtmpxsrc` and `rtmpxsink` take a single `uri`; `tc-url` remains as an
-optional connect override.
+Both take a single `uri`; `tc-url` remains as an optional connect override.
+A missing app or stream key in listen mode means "accept any".
 
-### rtmpxsrc modes
+### rtmpxsrc
 
-- `mode=listen` (default, `uri` defaults to `rtmp://0.0.0.0:1935/`): bind
-  the uri host:port, accept one publisher at a time, emit FLV
-  (`video/x-flv`, `streamheader` + `tagged-stream`). A missing app/key
-  accepts any (`rtmp://[::]:1234/` listens everywhere on 1234);
-  `rtmp://0.0.0.0:1935/live` requires app `live`; port `0` allocates a
-  free port and updates `uri`. Sans-I/O `ServerSession` drive with lifecycle
-  bus messages `rtmpx-publish-start` / `rtmpx-publish-end` and
-  `keep-listening`.
-- `mode=play`: connect and play a full uri (`rtmp://host:port/app/key`).
-  `tc-url` overrides the connect tcUrl (defaults to
-  `rtmp://host:port/app`). `reconnect=true` retries after
-  disconnect-class failures.
+Play is the default. `mode=play` connects and plays `rtmp://host:port/app/key`
+from a server; `mode=listen` binds `rtmp://bind-host:port[/app[/key]]` and waits
+for a publisher.
 
-Common timeouts are nanoseconds (`0` = disabled): `connect-timeout`,
-`accept-timeout` (listen), `handshake-timeout`, `read-timeout`,
-`write-timeout`. `tcp-nodelay` defaults on.
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | string | `play` | `play` connects to a server, `listen` waits for a publisher. |
+| `uri` | string | (none, required) | Play: `rtmp://host:port/app/key`. Listen: `rtmp://bind-host:port[/app[/key]]`. |
+| `tc-url` | string | (none) | Override tcUrl in the connect; defaults to `rtmp://host:port/app`. |
+| `tcp-nodelay` | boolean | `true` | Disable Nagle algorithm on the connection. |
+| `connect-timeout` | uint64 (ns) | `10000000000` (10 s) | Play: time allowed for TCP connect; `0` disables. |
+| `accept-timeout` | uint64 (ns) | `0` (wait indefinitely) | Listen: time to wait for a publisher. |
+| `handshake-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed per handshake read; `0` disables. |
+| `read-timeout` | uint64 (ns) | `0` (disabled) | Time allowed without session input; `0` disables. |
+| `write-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed per socket write; `0` disables. |
+| `graceful-shutdown-timeout` | uint64 (ns) | `0` (close immediately) | Listen: wait for the publisher to close during shutdown. |
+| `keep-listening` | boolean | `false` | Listen: wait for the next publisher after one ends instead of EOS. |
+| `reconnect` | boolean | `false` | Play: reconnect and resume after the server disconnects. |
 
-### rtmpxsink modes
+Signals and events: no GObject signals. Emits downstream custom events
+`rtmpx-publish-start` (`connection-id`) and `rtmpx-publish-end` (`connection-id`,
+`reason`) on the src pad, plus an element bus message `connection-removed`
+(`connection-id`, `reason`) per publisher.
 
-- `mode=publish` (default): connect to `uri` (`rtmp://host:port/app/key`)
-  plus optional `tc-url`, demux incoming FLV and publish it.
-- `mode=listen`: bind the uri host:port instead and serve one player at a
-  time, SRT-sink style. `render()` applies backpressure until a player
-  connects; with `wait-for-connection=false` buffers are dropped while no
-  player is connected. Sequence headers are replayed to mid-stream joiners
-  and the listener keeps accepting across player disconnects.
+Quirks: outputs a `video/x-flv` byte stream (FLV header + tags), pair with
+`flvdemux`. Listen serves one publisher at a time and each publisher starts a new
+stream generation (stream-start / caps / segment). Without `keep-listening` the
+first publisher ending ends the stream (EOS). The bind host must be an IP literal;
+port `0` allocates a free port and publishes it back on `uri`. Enhanced RTMP is
+advertised, so modern encoders keep negotiating HEVC/AV1/multitrack.
+
+### rtmpxsink
+
+Publish is the default. `mode=publish` connects to `rtmp://host:port/app/key` and
+publishes; `mode=listen` binds `rtmp://bind-host:port[/app[/key]]` and serves players.
+
+| Property | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | string | `publish` | `publish` connects to a server, `listen` serves players. |
+| `uri` | string | (none, required) | Publish: `rtmp://host:port/app/key`. Listen: `rtmp://bind-host:port[/app[/key]]`. |
+| `tc-url` | string | (none) | Override tcUrl in the connect; defaults to `rtmp://host:port/app`. |
+| `tcp-nodelay` | boolean | `true` | Disable Nagle algorithm on the connection. |
+| `connect-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed for TCP connect; `0` disables. |
+| `accept-timeout` | uint64 (ns) | `0` (wait indefinitely) | Listen: time to wait for a player. |
+| `wait-for-connection` | boolean | `true` | Listen: block (backpressure) until a player connects instead of dropping. |
+| `handshake-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed per handshake read; `0` disables. |
+| `read-timeout` | uint64 (ns) | `0` (disabled) | Time allowed without session input; `0` disables. |
+| `write-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed per socket write; `0` disables. |
+
+Signals and events: none. No GObject signals, downstream events, or bus messages.
+
+Quirks: expects a `video/x-flv` byte stream, pair with `flvmux`; publish mode demuxes
+it and publishes. Listen serves one player at a time SRT-sink style: `render()` blocks
+until a player connects, unless `wait-for-connection=false` (drop while unconnected).
+Sequence headers replay to late joiners and the listener keeps accepting across player
+disconnects until EOS/shutdown. Same bind rules as the source: IP literal, port `0`
+allocates and updates `uri`, missing app/key accepts any.
 
 ### Layout
 

@@ -25,7 +25,7 @@ use rtmpx::sessions::{
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_LISTEN_URI: &str = "rtmp://0.0.0.0:1935/";
+const DEFAULT_MODE: &str = "play";
 const DEFAULT_TCP_NODELAY: bool = true;
 const DEFAULT_ACCEPT_TIMEOUT: u64 = 0;
 const DEFAULT_HANDSHAKE_TIMEOUT: u64 = 10_000_000_000;
@@ -33,7 +33,6 @@ const DEFAULT_READ_TIMEOUT: u64 = 0;
 const DEFAULT_WRITE_TIMEOUT: u64 = 10_000_000_000;
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT: u64 = 0;
 const DEFAULT_KEEP_LISTENING: bool = false;
-const DEFAULT_MODE: &str = "listen";
 const DEFAULT_CONNECT_TIMEOUT: u64 = 10_000_000_000;
 const DEFAULT_RECONNECT: bool = false;
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
@@ -60,7 +59,7 @@ impl Default for Settings {
   fn default() -> Self {
     Self {
       mode: DEFAULT_MODE.into(),
-      uri: Some(DEFAULT_LISTEN_URI.into()),
+      uri: None,
       tcp_nodelay: DEFAULT_TCP_NODELAY,
       connect_timeout: DEFAULT_CONNECT_TIMEOUT,
       accept_timeout: DEFAULT_ACCEPT_TIMEOUT,
@@ -138,14 +137,13 @@ impl ObjectImpl for RtmpxSrc {
       vec![
         glib::ParamSpecString::builder("mode")
           .nick("Mode")
-          .blurb("Source mode: listen waits for a publisher, play connects and plays from a server")
+          .blurb("Source mode: play connects and plays from a server, listen waits for a publisher")
           .default_value(Some(DEFAULT_MODE))
           .mutable_ready()
           .build(),
         glib::ParamSpecString::builder("uri")
           .nick("URI")
-          .blurb("RTMP URI. Listen: rtmp://bind-host:port[/app[/key]] (missing app/key accepts any; port 0 allocates one). Play: rtmp://host:port/app/key")
-          .default_value(Some(DEFAULT_LISTEN_URI))
+          .blurb("RTMP URI. Play (default): rtmp://host:port/app/key. Listen: rtmp://bind-host:port[/app[/key]] (missing app/key accepts any; port 0 allocates one)")
           .mutable_ready()
           .build(),
         glib::ParamSpecBoolean::builder("tcp-nodelay")
