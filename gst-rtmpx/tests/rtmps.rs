@@ -118,7 +118,7 @@ fn make_cert(tag: &str) -> (String, String) {
   let cert_path = dir.join(format!("{file_tag}-cert.pem"));
   let key_path = dir.join(format!("{file_tag}-key.pem"));
   std::fs::write(&cert_path, certified.cert.pem()).expect("cert must write");
-  std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("key must write");
+  std::fs::write(&key_path, certified.signing_key.serialize_pem()).expect("key must write");
   (
     cert_path.to_str().unwrap().to_owned(),
     key_path.to_str().unwrap().to_owned(),

@@ -382,13 +382,16 @@ fn probe_publish(port: u16, key: &str) -> String {
           Instant::now() < deadline,
           "server neither accepted nor denied the publish"
         );
-        let reply = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        let reply = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
           .await
           .expect("publish reply must not hang")
-          .expect("server must answer the publish");
-        if reply == 0 {
-          break;
-        }
+        {
+          Ok(0) => break,
+          Ok(n) => n,
+          // Denial closes the connection; macOS surfaces RST instead of EOF.
+          Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+          Err(e) => panic!("server must answer the publish: {e}"),
+        };
         let results = session
           .handle_input(&buf[..reply])
           .expect("publish reply must parse");

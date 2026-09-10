@@ -1252,7 +1252,7 @@ mod tests {
     let cert_path = dir.join(format!("{tag}-cert.pem"));
     let key_path = dir.join(format!("{tag}-key.pem"));
     std::fs::write(&cert_path, certified.cert.pem()).expect("cert must write");
-    std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("key must write");
+    std::fs::write(&key_path, certified.signing_key.serialize_pem()).expect("key must write");
 
     let runtime = tokio::runtime::Builder::new_current_thread()
       .enable_all()
@@ -1336,11 +1336,17 @@ mod tests {
     let client_cert_path = dir.join(format!("{tag}-client-cert.pem"));
     let client_key_path = dir.join(format!("{tag}-client-key.pem"));
     std::fs::write(&server_cert_path, server_certified.cert.pem()).expect("cert must write");
-    std::fs::write(&server_key_path, server_certified.key_pair.serialize_pem())
-      .expect("key must write");
+    std::fs::write(
+      &server_key_path,
+      server_certified.signing_key.serialize_pem(),
+    )
+    .expect("key must write");
     std::fs::write(&client_cert_path, client_certified.cert.pem()).expect("cert must write");
-    std::fs::write(&client_key_path, client_certified.key_pair.serialize_pem())
-      .expect("key must write");
+    std::fs::write(
+      &client_key_path,
+      client_certified.signing_key.serialize_pem(),
+    )
+    .expect("key must write");
     let to_str = |path: &std::path::PathBuf| path.to_str().unwrap().to_owned();
     let server_cert = to_str(&server_cert_path);
     let server_key = to_str(&server_key_path);
@@ -1464,11 +1470,17 @@ mod tests {
     let client_cert_path = dir.join(format!("{tag}-client-cert.pem"));
     let client_key_path = dir.join(format!("{tag}-client-key.pem"));
     std::fs::write(&server_cert_path, server_certified.cert.pem()).expect("cert must write");
-    std::fs::write(&server_key_path, server_certified.key_pair.serialize_pem())
-      .expect("key must write");
+    std::fs::write(
+      &server_key_path,
+      server_certified.signing_key.serialize_pem(),
+    )
+    .expect("key must write");
     std::fs::write(&client_cert_path, client_certified.cert.pem()).expect("cert must write");
-    std::fs::write(&client_key_path, client_certified.key_pair.serialize_pem())
-      .expect("key must write");
+    std::fs::write(
+      &client_key_path,
+      client_certified.signing_key.serialize_pem(),
+    )
+    .expect("key must write");
     let to_str = |path: &std::path::PathBuf| path.to_str().unwrap().to_owned();
     let server_cert = to_str(&server_cert_path);
     let server_key = to_str(&server_key_path);

@@ -18,7 +18,7 @@ capi = []
 bytes = "1.12"
 # Protocol sessions (client + server) come from the rtmpx crate on crates.io.
 rtmpx = "2.0"
-flume = "0.11"
+flume = "0.12"
 gst = { package = "gstreamer", version = "0.25.3", features = ["v1_28"] }
 gst-base = { package = "gstreamer-base", version = "0.25.3", features = ["v1_28"] }
 tokio = { version = "1.53", features = ["macros", "net", "rt", "sync", "time", "io-util"] }
@@ -30,7 +30,7 @@ rustls-native-certs = "0.8"
 
 [dev-dependencies]
 gst-check = { package = "gstreamer-check", version = "0.25", features = ["v1_28"] }
-rcgen = "0.13"
+rcgen = "0.14"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.8.4"
