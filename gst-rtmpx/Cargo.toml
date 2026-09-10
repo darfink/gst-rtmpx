@@ -31,7 +31,7 @@ rustls-native-certs = "0.8"
 
 [dev-dependencies]
 gst-check = { package = "gstreamer-check", version = "0.25", features = ["v1_28"] }
-rcgen = "0.13"
+rcgen = "0.14"
 
 [build-dependencies]
 gst-plugin-version-helper = "0.8.4"
