@@ -89,6 +89,10 @@ cd gst-rtmpx
 cargo build --release
 ```
 
+Prefer not to build? Each [release](https://github.com/darfink/gst-rtmpx/releases)
+ships prebuilt `libgstrtmpx` libraries for Linux (`.so`) and macOS (`.dylib`);
+drop one onto `GST_PLUGIN_PATH` or install it per below.
+
 This uses GST_PLUGIN_PATH, so no install or root access is needed.
 
 ```sh
