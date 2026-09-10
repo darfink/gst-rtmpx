@@ -101,7 +101,7 @@ ends that player, not the listener.
 From the repository root:
 
 ```sh
-cargo build -p gst-rtmpx
-export GST_PLUGIN_PATH=$PWD/target/debug
+cargo build --release
+export GST_PLUGIN_PATH="$PWD/target/release"
 gst-inspect-1.0 rtmpxsrc rtmpxsink
 ```

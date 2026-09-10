@@ -84,15 +84,26 @@ gst-launch-1.0 -e rtmpxsrc mode=listen uri=rtmps://0.0.0.0:1935/live tls-cert=/e
 Requires Rust 1.97+ and GStreamer 1.28 development headers.
 
 ```sh
-cargo build --workspace --release
+git clone https://github.com/darfink/gst-rtmpx.git
+cd gst-rtmpx
+cargo build --release
 ```
 
-Expose the built plugin and confirm both elements register:
+This uses GST_PLUGIN_PATH, so no install or root access is needed.
 
 ```sh
 export GST_PLUGIN_PATH="$PWD/target/release"
 gst-inspect-1.0 rtmpxsrc rtmpxsink
 ```
+
+For a permanent install instead of `GST_PLUGIN_PATH`, copy the library
+into the GStreamer plugin directory:
+
+```sh
+sudo install -m 0755 target/release/libgstrtmpx.so "$(pkg-config --variable=pluginsdir gstreamer-1.0)/"
+```
+
+(On macOS the file is `libgstrtmpx.dylib`, and `~/.local/share/gstreamer-1.0/plugins/` works without sudo.)
 
 On macOS with the GStreamer framework build, point pkg-config at it first:
 
