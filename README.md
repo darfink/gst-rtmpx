@@ -96,14 +96,16 @@ export GST_PLUGIN_PATH="$PWD/target/release"
 gst-inspect-1.0 rtmpxsrc rtmpxsink
 ```
 
-For a permanent install instead of `GST_PLUGIN_PATH`, copy the library
-into the GStreamer plugin directory:
+For a permanent install instead of `GST_PLUGIN_PATH`:
 
 ```sh
+# System-wide (needs root):
 sudo install -m 0755 target/release/libgstrtmpx.so "$(pkg-config --variable=pluginsdir gstreamer-1.0)/"
+# Or just for your user (no root needed):
+install -m 0755 target/release/libgstrtmpx.so ~/.local/share/gstreamer-1.0/plugins/
 ```
 
-(On macOS the file is `libgstrtmpx.dylib`, and `~/.local/share/gstreamer-1.0/plugins/` works without sudo.)
+(On macOS the file is `libgstrtmpx.dylib`.)
 
 On macOS with the GStreamer framework build, point pkg-config at it first:
 
