@@ -216,12 +216,12 @@ impl ObjectImpl for RtmpxSrc {
           .build(),
         glib::ParamSpecString::builder("tls-cert")
           .nick("TLS certificate")
-          .blurb("Listen mode with an rtmps:// uri: path to the PEM certificate chain file the listener presents")
+        .blurb("Certificate this element presents (rtmps://): the listener's server certificate in listen mode (required); the mTLS client certificate in play/publish mode (optional, needs tls-key too)")
           .mutable_ready()
           .build(),
         glib::ParamSpecString::builder("tls-key")
           .nick("TLS private key")
-          .blurb("Listen mode with an rtmps:// uri: path to the PEM private key file matching tls-cert")
+        .blurb("PEM private key matching tls-cert")
           .mutable_ready()
           .build(),
         glib::ParamSpecString::builder("tls-ca-cert")
@@ -1034,7 +1034,14 @@ async fn connect_and_play(
   .await?;
 
   let mut stream = if endpoint.tls {
-    wrap_tls_client(stream, &endpoint.host, settings.tls_ca_cert.as_deref()).await?
+    wrap_tls_client(
+      stream,
+      &endpoint.host,
+      settings.tls_ca_cert.as_deref(),
+      settings.tls_cert.as_deref(),
+      settings.tls_key.as_deref(),
+    )
+    .await?
   } else {
     RtmpStream::Plain(stream)
   };

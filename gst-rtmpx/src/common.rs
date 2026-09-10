@@ -697,10 +697,42 @@ fn read_pem_file(path: &str, what: &str) -> Result<Vec<u8>, String> {
   std::fs::read(path).map_err(|error| format!("Failed to read {what} file '{path}': {error}"))
 }
 
+fn load_cert_chain(
+  path: &str,
+  what: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+  let pem = read_pem_file(path, what)?;
+  let mut reader = pem.as_slice();
+  let certs: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(&mut reader)
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| format!("Failed to parse {what} file '{path}': {error}"))?;
+  if certs.is_empty() {
+    return Err(format!("{what} file '{path}' contains no certificates"));
+  }
+  Ok(certs)
+}
+
+fn load_private_key(
+  path: &str,
+  what: &str,
+) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+  let pem = read_pem_file(path, what)?;
+  let mut reader = pem.as_slice();
+  rustls_pemfile::private_key(&mut reader)
+    .map_err(|error| format!("Failed to parse {what} file '{path}': {error}"))?
+    .ok_or_else(|| format!("{what} file '{path}' contains no private key"))
+}
+
 /// rustls client config: the platform trust store plus one optional extra
 /// PEM bundle (tls-ca-cert), which is how self-signed or private-CA servers
-/// are trusted without touching the system store.
-pub fn build_tls_client_config(ca_cert_file: Option<&str>) -> Result<rustls::ClientConfig, String> {
+/// are trusted without touching the system store. An optional client
+/// identity (tls-cert + tls-key) is presented to servers that request mTLS;
+/// set both or neither.
+pub fn build_tls_client_config(
+  ca_cert_file: Option<&str>,
+  cert_file: Option<&str>,
+  key_file: Option<&str>,
+) -> Result<rustls::ClientConfig, String> {
   let mut roots = rustls::RootCertStore::empty();
   let native = rustls_native_certs::load_native_certs();
   if !native.errors.is_empty() {
@@ -736,22 +768,44 @@ pub fn build_tls_client_config(ca_cert_file: Option<&str>) -> Result<rustls::Cli
       ));
     }
   }
-  Ok(
-    rustls::ClientConfig::builder()
-      .with_root_certificates(roots)
-      .with_no_client_auth(),
-  )
+  let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+  finish_tls_client_config(builder, cert_file, key_file)
+}
+
+fn finish_tls_client_config(
+  builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+  cert_file: Option<&str>,
+  key_file: Option<&str>,
+) -> Result<rustls::ClientConfig, String> {
+  let cert = cert_file.filter(|path| !path.is_empty());
+  let key = key_file.filter(|path| !path.is_empty());
+  match (cert, key) {
+    (None, None) => Ok(builder.with_no_client_auth()),
+    (Some(cert), Some(key)) => {
+      let certs = load_cert_chain(cert, "TLS client certificate")?;
+      let key = load_private_key(key, "TLS client private key")?;
+      builder
+        .with_client_auth_cert(certs, key)
+        .map_err(|error| format!("Invalid TLS client certificate/key pair: {error}"))
+    }
+    _ => {
+      Err("tls-cert and tls-key must be set together for mTLS client authentication".to_string())
+    }
+  }
 }
 
 /// Wrap a connected TCP stream in a TLS client session for an rtmps://
 /// server. SNI comes from the URI host (DNS name or IP literal); the
-/// certificate is verified against the platform store + tls-ca-cert.
+/// certificate is verified against the platform store + tls-ca-cert. When
+/// tls-cert/tls-key are also set, that identity is presented for mTLS.
 pub async fn wrap_tls_client(
   stream: tokio::net::TcpStream,
   host: &str,
   ca_cert_file: Option<&str>,
+  cert_file: Option<&str>,
+  key_file: Option<&str>,
 ) -> Result<RtmpStream, SessionFailure> {
-  let config = build_tls_client_config(ca_cert_file)
+  let config = build_tls_client_config(ca_cert_file, cert_file, key_file)
     .map_err(|message| SessionFailure::error(format!("TLS setup failed: {message}")))?;
   let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
   let server_name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|_| {
@@ -1136,9 +1190,20 @@ mod tests {
   #[test]
   fn tls_builders_reject_missing_files() {
     assert!(build_tls_acceptor("/nonexistent/cert.pem", "/nonexistent/key.pem").is_err());
-    assert!(build_tls_client_config(Some("/nonexistent/ca.pem")).is_err());
+    assert!(build_tls_client_config(Some("/nonexistent/ca.pem"), None, None).is_err());
     // A client config without extras still builds (platform trust store).
-    assert!(build_tls_client_config(None).is_ok());
+    assert!(build_tls_client_config(None, None, None).is_ok());
+    // mTLS identity is all or nothing: half a pair is a settings error.
+    assert!(build_tls_client_config(None, Some("/nonexistent/cert.pem"), None).is_err());
+    assert!(build_tls_client_config(None, None, Some("/nonexistent/key.pem")).is_err());
+    assert!(
+      build_tls_client_config(
+        None,
+        Some("/nonexistent/cert.pem"),
+        Some("/nonexistent/key.pem")
+      )
+      .is_err()
+    );
   }
 
   /// Self-signed roundtrip: TLS acceptor + TLS client over loopback TCP,
@@ -1202,7 +1267,7 @@ mod tests {
         let tcp = tokio::net::TcpStream::connect(address)
           .await
           .expect("client must connect");
-        let mut stream = wrap_tls_client(tcp, "127.0.0.1", Some(ca.as_str()))
+        let mut stream = wrap_tls_client(tcp, "127.0.0.1", Some(ca.as_str()), None, None)
           .await
           .expect("client TLS handshake must complete");
         let trailing = client_handshake(&mut stream, &CancellationToken::new(), &None)
@@ -1220,6 +1285,133 @@ mod tests {
 
     std::fs::remove_file(&cert_path).ok();
     std::fs::remove_file(&key_path).ok();
+  }
+
+  /// mTLS: a server that requires client authentication sees the identity
+  /// from tls-cert/tls-key, and refuses a client that presents none.
+  #[test]
+  fn tls_client_identity_is_presented_for_mtls() {
+    let server_certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+      .expect("server cert must generate");
+    let client_certified = rcgen::generate_simple_self_signed(vec!["mtls-client".to_string()])
+      .expect("client cert must generate");
+    let dir = std::env::temp_dir();
+    let tag = format!("rtmpx-mtls-{}", std::process::id());
+    let server_cert_path = dir.join(format!("{tag}-server-cert.pem"));
+    let server_key_path = dir.join(format!("{tag}-server-key.pem"));
+    let client_cert_path = dir.join(format!("{tag}-client-cert.pem"));
+    let client_key_path = dir.join(format!("{tag}-client-key.pem"));
+    std::fs::write(&server_cert_path, server_certified.cert.pem()).expect("cert must write");
+    std::fs::write(&server_key_path, server_certified.key_pair.serialize_pem())
+      .expect("key must write");
+    std::fs::write(&client_cert_path, client_certified.cert.pem()).expect("cert must write");
+    std::fs::write(&client_key_path, client_certified.key_pair.serialize_pem())
+      .expect("key must write");
+    let to_str = |path: &std::path::PathBuf| path.to_str().unwrap().to_owned();
+    let server_cert = to_str(&server_cert_path);
+    let server_key = to_str(&server_key_path);
+    let client_cert = to_str(&client_cert_path);
+    let client_key = to_str(&client_key_path);
+
+    // The test server trusts exactly the client certificate and requires it.
+    let mut client_roots = rustls::RootCertStore::empty();
+    for cert in
+      load_cert_chain(&client_cert, "TLS client certificate").expect("client cert must load")
+    {
+      client_roots
+        .add(cert)
+        .expect("client cert must be a valid trust anchor");
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(client_roots))
+      .build()
+      .expect("client verifier must build");
+    let server_config = rustls::ServerConfig::builder()
+      .with_client_cert_verifier(verifier)
+      .with_single_cert(
+        load_cert_chain(&server_cert, "TLS server certificate").expect("server cert must load"),
+        load_private_key(&server_key, "TLS server private key").expect("server key must load"),
+      )
+      .expect("server config must build");
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime must build");
+    runtime.block_on(async move {
+      use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+      // One connection: TLS-accept, report how many peer certificates the
+      // client presented, then ping it so the client can finish.
+      let serve_once = |acceptor: tokio_rustls::TlsAcceptor,
+                        listener: tokio::net::TcpListener| async move {
+        let (tcp, _) = listener.accept().await.expect("server must accept TCP");
+        let mut tls = acceptor.accept(tcp).await.map_err(|error| format!("server TLS: {error}"))?;
+        let count = tls
+          .get_ref()
+          .1
+          .peer_certificates()
+          .map(|certs| certs.len())
+          .unwrap_or(0);
+        tls.write_all(&[0x07]).await.map_err(|error| format!("server write: {error}"))?;
+        tls.flush().await.map_err(|error| format!("server flush: {error}"))?;
+        Ok::<usize, String>(count)
+      };
+
+      // Positive: the client presents its identity and the server sees it.
+      let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("must bind");
+      let address = listener.local_addr().expect("must have an address");
+      let server = tokio::spawn(serve_once(acceptor.clone(), listener));
+      let tcp = tokio::net::TcpStream::connect(address).await.expect("must connect");
+      let mut stream = wrap_tls_client(
+        tcp,
+        "127.0.0.1",
+        Some(server_cert.as_str()),
+        Some(client_cert.as_str()),
+        Some(client_key.as_str()),
+      )
+      .await
+      .expect("mTLS handshake must complete");
+      let mut byte = [0u8; 1];
+      stream.read_exact(&mut byte).await.expect("must read ping");
+      assert_eq!(byte, [0x07]);
+      assert_eq!(server.await.expect("server task must finish").expect("server must accept"), 1);
+
+      // Negative: no identity, so the requiring server must refuse.
+      let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("must bind");
+      let address = listener.local_addr().expect("must have an address");
+      let server = tokio::spawn(serve_once(acceptor.clone(), listener));
+      let tcp = tokio::net::TcpStream::connect(address).await.expect("must connect");
+      // In TLS 1.3 the client finishes its flight before the server
+      // validates the (missing) certificate, so connect succeeds and the
+      // refusal surfaces on first read (alert) or EOF (close).
+      let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        wrap_tls_client(tcp, "127.0.0.1", Some(server_cert.as_str()), None, None),
+      )
+      .await
+      .expect("client flight must send")
+      .expect("client flight must send");
+      let mut buf = [0u8; 1];
+      let read = tokio::time::timeout(std::time::Duration::from_secs(15), stream.read(&mut buf))
+        .await
+        .expect("read must resolve");
+      assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "server must refuse a client with no certificate, got {read:?}"
+      );
+      let server_result =
+        tokio::time::timeout(std::time::Duration::from_secs(15), server).await;
+      assert!(
+        matches!(server_result, Ok(Ok(Err(_)))),
+        "server accept must fail without a client certificate"
+      );
+    });
+
+    std::fs::remove_file(&server_cert_path).ok();
+    std::fs::remove_file(&server_key_path).ok();
+    std::fs::remove_file(&client_cert_path).ok();
+    std::fs::remove_file(&client_key_path).ok();
   }
 
   #[test]

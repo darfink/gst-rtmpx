@@ -33,8 +33,8 @@ for a publisher.
 | `graceful-shutdown-timeout` | uint64 (ns) | `0` (close immediately) | Listen: wait for the publisher to close during shutdown. |
 | `keep-listening` | boolean | `false` | Listen: wait for the next publisher after one ends instead of EOS. |
 | `reconnect` | boolean | `false` | Play: reconnect and resume after the server disconnects. |
-| `tls-cert` | string | (none) | Listen with `rtmps://`: PEM certificate chain file the listener presents. |
-| `tls-key` | string | (none) | Listen with `rtmps://`: PEM private key file matching `tls-cert`. |
+| `tls-cert` | string | (none) | Certificate presented (`rtmps://`): server certificate in listen mode (required); mTLS client certificate in play mode (optional, needs `tls-key`). |
+| `tls-key` | string | (none) | PEM private key matching `tls-cert`. |
 | `tls-ca-cert` | string | (none) | Play with `rtmps://`: extra PEM CA bundle trusted alongside the platform store. |
 
 Signals and events: no GObject signals. Emits downstream custom events
@@ -66,8 +66,8 @@ publishes; `mode=listen` binds `rtmp://bind-host:port[/app[/key]]` and serves pl
 | `handshake-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed per handshake read; `0` disables. |
 | `read-timeout` | uint64 (ns) | `0` (disabled) | Time allowed without session input; `0` disables. |
 | `write-timeout` | uint64 (ns) | `10000000000` (10 s) | Time allowed per socket write; `0` disables. |
-| `tls-cert` | string | (none) | Listen with `rtmps://`: PEM certificate chain file the listener presents. |
-| `tls-key` | string | (none) | Listen with `rtmps://`: PEM private key file matching `tls-cert`. |
+| `tls-cert` | string | (none) | Certificate presented (`rtmps://`): server certificate in listen mode (required); mTLS client certificate in publish mode (optional, needs `tls-key`). |
+| `tls-key` | string | (none) | PEM private key matching `tls-cert`. |
 | `tls-ca-cert` | string | (none) | Publish with `rtmps://`: extra PEM CA bundle trusted alongside the platform store. |
 
 Signals and events: none. No GObject signals, downstream events, or bus messages.
