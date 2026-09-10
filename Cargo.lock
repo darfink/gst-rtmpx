@@ -843,7 +843,7 @@ dependencies = [
 [[package]]
 name = "rtmpx"
 version = "2.0.0"
-source = "git+https://github.com/darfink/rtmpx?branch=main#2d0894fdd3285ad688c9670f3cb99aca0075af15"
+source = "git+https://github.com/darfink/rtmpx?branch=main#f00b4a0d851d4faabb347fd911f346d191db8409"
 dependencies = [
  "byteorder",
  "bytes",
