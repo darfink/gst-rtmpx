@@ -16,9 +16,8 @@ capi = []
 
 [dependencies]
 bytes = "1.12"
-# Protocol sessions (client + server) come from the rtmpx crate on GitHub.
-# Pinned to main via Cargo.lock; switch to a crates.io version once published.
-rtmpx = { git = "https://github.com/darfink/rtmpx", branch = "main" }
+# Protocol sessions (client + server) come from the rtmpx crate on crates.io.
+rtmpx = "2.0"
 flume = "0.11"
 gst = { package = "gstreamer", version = "0.25.3", features = ["v1_28"] }
 gst-base = { package = "gstreamer-base", version = "0.25.3", features = ["v1_28"] }

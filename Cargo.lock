@@ -843,7 +843,8 @@ dependencies = [
 [[package]]
 name = "rtmpx"
 version = "2.0.0"
-source = "git+https://github.com/darfink/rtmpx?branch=main#2d0894fdd3285ad688c9670f3cb99aca0075af15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4750264eab39cc6ae846944a14893c1fb69caa4c84a0e5883dfc1dc76014199b"
 dependencies = [
  "byteorder",
  "bytes",
