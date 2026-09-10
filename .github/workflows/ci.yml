@@ -13,7 +13,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install GStreamer
         run: |
           sudo apt-get update
@@ -36,7 +36,7 @@ jobs:
       matrix:
         os: [ubuntu-26.04, macos-14]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install GStreamer (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -63,7 +63,7 @@ jobs:
     name: integration script
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -79,5 +79,5 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -t gst-rtmpx .
