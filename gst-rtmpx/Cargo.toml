@@ -1,6 +1,6 @@
 [package]
 name = "gst-rtmpx"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Elliott Linder <elliott@linder.dev>"]
 description = "GStreamer RTMP source and sink elements built on rtmpx"
