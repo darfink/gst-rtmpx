@@ -2,9 +2,9 @@
 // The sink binds and serves raw RTMP players, applying backpressure
 // until one connects. No ffmpeg or external server is used.
 use gst::prelude::*;
-use rtmpx::amf0::{Amf0Object, Amf0Value};
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{
+use rtmpx_legacy::amf0::{Amf0Object, Amf0Value};
+use rtmpx_legacy::handshake::{Handshake, HandshakeProcessResult, PeerType};
+use rtmpx_legacy::sessions::{
   ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult,
 };
 use std::fmt::Write as _;
@@ -97,6 +97,7 @@ struct Collected {
   accepted: bool,
   videos: Vec<(u32, Vec<u8>)>,
   audios: Vec<(u32, Vec<u8>)>,
+  scripts: Vec<(u32, Vec<u8>)>,
   transcript: String,
 }
 async fn player_write(stream: &mut tokio::net::TcpStream, result: ClientSessionResult) {
@@ -158,6 +159,12 @@ fn sink_listen_serves_player_live_classic() {
   push_bytes(&mut sink, &flv_header());
   push_bytes(&mut sink, &frame_tag(9, 0, &vseq));
   push_bytes(&mut sink, &frame_tag(8, 0, &aseq));
+  let script = rtmpx_legacy::amf0::serialize(&[
+    Amf0Value::Utf8String("onCaption".into()),
+    Amf0Value::Utf8String("hello".into()),
+  ])
+  .unwrap();
+  push_bytes(&mut sink, &frame_tag(18, 25, &script));
   push_bytes(&mut sink, &frame_tag(9, 40, &v1));
   push_bytes(&mut sink, &frame_tag(8, 60, &a1));
   push_bytes(&mut sink, &frame_tag(9, 80, &v2));
@@ -173,6 +180,19 @@ fn sink_listen_serves_player_live_classic() {
   assert_eq!(collected.audios[0], (0, aseq.clone()));
   assert_eq!(collected.audios[1], (60, a1.clone()));
   assert_eq!(collected.audios[2], (100, a2.clone()));
+  // RTMP playback emits sample-access and data-start before application data.
+  assert_eq!(collected.scripts.len(), 3);
+  for ((_, data), name) in collected.scripts[..2]
+    .iter()
+    .zip(["|RtmpSampleAccess", "onStatus"])
+  {
+    let values = rtmpx_legacy::amf0::deserialize(&mut data.as_slice()).unwrap();
+    assert_eq!(
+      values[0],
+      rtmpx_legacy::amf0::Amf0Value::Utf8String(name.into())
+    );
+  }
+  assert_eq!(collected.scripts[2], (25, script));
   sink.push_event(gst::event::Eos::new());
   shutdown_sink(&sink);
 }
@@ -423,6 +443,7 @@ fn run_player_blocking(
       let mut transcript = String::new();
       let mut videos: Vec<(u32, Vec<u8>)> = Vec::new();
       let mut audios: Vec<(u32, Vec<u8>)> = Vec::new();
+      let mut scripts = Vec::new();
       let mut accepted = false;
       let mut notified = false;
       let notify_ready = |accepted_flag: bool,
@@ -531,6 +552,7 @@ fn run_player_blocking(
               accepted: false,
               videos,
               audios,
+              scripts,
               transcript,
             };
           }
@@ -594,6 +616,12 @@ fn run_player_blocking(
             }) => {
               audios.push((timestamp.value, data.to_vec()));
             }
+            ClientSessionResult::RaisedEvent(ClientSessionEvent::StreamDataReceived {
+              message,
+              ..
+            }) => {
+              scripts.push((message.timestamp().value, message.into_payload().to_vec()));
+            }
             ClientSessionResult::OutboundResponse(packet) => {
               stream
                 .write_all(&packet.bytes)
@@ -616,6 +644,7 @@ fn run_player_blocking(
         accepted,
         videos,
         audios,
+        scripts,
         transcript,
       }
     })

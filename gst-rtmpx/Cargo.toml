@@ -17,7 +17,7 @@ capi = []
 [dependencies]
 bytes = "1.12"
 # Protocol sessions (client + server) come from the rtmpx crate on crates.io.
-rtmpx = "2.0"
+rtmpx = "3.0"
 flume = "0.12"
 gst = { package = "gstreamer", version = "0.25.3", features = ["v1_28"] }
 gst-base = { package = "gstreamer-base", version = "0.25.3", features = ["v1_28"] }
@@ -29,6 +29,8 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
+# Released v2 peers independently exercise RTMP wire compatibility.
+rtmpx-legacy = { package = "rtmpx", version = "=2.0.0" }
 gst-check = { package = "gstreamer-check", version = "0.25", features = ["v1_28"] }
 rcgen = "0.14"
 

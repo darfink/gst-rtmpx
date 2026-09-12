@@ -1,3 +1,4 @@
+use bytes::{Bytes, BytesMut};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -8,10 +9,10 @@ use crate::common::{
   CAT_SRC as CAT, CREATE_POLL_INTERVAL, ClientEndpoint, FLV_TAG_AUDIO, FLV_TAG_SCRIPT_DATA,
   FLV_TAG_VIDEO, FlvTagWriter, OUTPUT_QUEUE_CAPACITY, PublishIds, RtmpStream, SessionFailure,
   WORKER_START_TIMEOUT, WorkerOutput, accept_tls_server, bracketed_host, client_handshake,
-  enhanced_rtmp_capabilities, nanoseconds_timeout, new_client_session, parse_rtmp_uri,
-  publish_event, read_session_chunk, require_uri, resolve_client_endpoint, resolve_tls_acceptor,
-  send_output, send_publish_end, server_handshake, tcp_connect, wrap_tls_client,
-  write_client_results, write_session_results,
+  enhanced_rtmp_capabilities, flush_client, flush_server, nanoseconds_timeout, new_client_session,
+  parse_rtmp_uri, publish_event, read_session_chunk, require_uri, resolve_client_endpoint,
+  resolve_tls_acceptor, send_output, send_publish_end, server_handshake, tcp_connect,
+  wrap_tls_client,
 };
 use gst::glib;
 use gst::prelude::*;
@@ -20,8 +21,8 @@ use gst_base::prelude::*;
 use gst_base::subclass::base_src::CreateSuccess;
 use gst_base::subclass::prelude::*;
 use rtmpx::sessions::{
-  ClientSession, ClientSessionEvent, ClientSessionResult, RequestId, ServerSession,
-  ServerSessionConfig, ServerSessionEvent, ServerSessionResult, StreamId,
+  ClientEvent, ClientOutput, ClientSession, RequestId, ServerEvent, ServerOutput, ServerSession,
+  ServerSessionConfig, StreamId,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -1003,7 +1004,7 @@ impl PlaySession {
     &mut self,
     tag_type: u8,
     timestamp: u32,
-    payload: &[u8],
+    payload: &(impl rtmpx::Segments + ?Sized),
   ) -> Result<(), SessionFailure> {
     self.writer.push_media(tag_type, timestamp, payload).await
   }
@@ -1062,27 +1063,18 @@ async fn connect_and_play(
     endpoint.stream_key.clone(),
     publish_ids,
   );
-  let connect = session
-    .request_connection_with_properties(endpoint.app.clone(), enhanced_rtmp_capabilities())
+  session
+    .connect_with_properties(endpoint.app.clone(), enhanced_rtmp_capabilities())
     .map_err(|error| {
       SessionFailure::error(format!("failed to request RTMP connection: {error:?}"))
     })?;
-  write_client_results(
-    &mut stream,
-    vec![connect],
-    output,
-    cancellation,
-    &write_timeout,
-  )
-  .await?;
+  flush_client(&mut stream, &mut session, &write_timeout).await?;
   if !carry.is_empty() {
-    let results = session
-      .handle_input(&carry)
-      .map_err(|error| SessionFailure::error(format!("server sent unreadable RTMP: {error:?}")))?;
+    let mut results = Bytes::from(carry);
     if !process_client_results(
       &mut session,
       &mut stream,
-      results,
+      &mut results,
       &mut play,
       output,
       cancellation,
@@ -1093,7 +1085,7 @@ async fn connect_and_play(
       return Ok(true);
     }
   }
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     let n = match read_session_chunk(&mut stream, &mut read_buf, cancellation, &read_timeout).await
     {
@@ -1108,13 +1100,11 @@ async fn connect_and_play(
     if n == 0 {
       return Ok(false);
     }
-    let results = session
-      .handle_input(&read_buf[..n])
-      .map_err(|error| SessionFailure::error(format!("server sent unreadable RTMP: {error:?}")))?;
+    let mut results = read_buf.split().freeze();
     if !process_client_results(
       &mut session,
       &mut stream,
-      results,
+      &mut results,
       &mut play,
       output,
       cancellation,
@@ -1127,46 +1117,39 @@ async fn connect_and_play(
   }
 }
 
-/// Handle one batch of client session results: write outbound packets and
+/// Pull client session outputs: write outbound packets and
 /// react to raised events. Returns Ok(true) to keep reading, Ok(false) when
 /// the server cleanly ended playback.
 async fn process_client_results(
   session: &mut ClientSession,
   stream: &mut RtmpStream,
-  results: Vec<ClientSessionResult>,
+  results: &mut Bytes,
   play: &mut PlaySession,
-  output: &flume::Sender<WorkerOutput>,
-  cancellation: &CancellationToken,
+  _output: &flume::Sender<WorkerOutput>,
+  _cancellation: &CancellationToken,
   write_timeout: &Option<Duration>,
 ) -> Result<bool, SessionFailure> {
-  // rtmpx emits [WindowAck, ConnectionAccepted event, SetChunkSize] for a
-  // connect accept. Our createStream/play request must go after the whole
-  // batch (especially SetChunkSize) to keep the session's outbound order.
-  // Sending play early reorders SetChunkSize behind createStream.
-  let mut play_requested = false;
-  for result in results {
+  while let Some(result) = session
+    .receive(results)
+    .map_err(|e| SessionFailure::error(format!("invalid RTMP input: {e}")))?
+  {
     match result {
-      ClientSessionResult::OutboundResponse(packet) => {
-        write_client_results(
-          stream,
-          vec![ClientSessionResult::OutboundResponse(packet)],
-          output,
-          cancellation,
-          write_timeout,
-        )
-        .await?;
+      ClientOutput::Packet(packet) => {
+        crate::common::write_packet(stream, packet, write_timeout).await?;
       }
-      ClientSessionResult::RaisedEvent(event) => match event {
-        ClientSessionEvent::ConnectionRequestAccepted { .. } => {
+      ClientOutput::Event(event) => match event {
+        ClientEvent::ConnectionRequestAccepted { .. } => {
           gst::info!(CAT, "RTMP server accepted connection");
-          play_requested = true;
+          session
+            .play(&play.stream_key)
+            .map_err(|e| SessionFailure::error(format!("failed to request playback: {e}")))?;
         }
-        ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
+        ClientEvent::ConnectionRequestRejected { description, .. } => {
           return Err(SessionFailure::error(format!(
             "RTMP server rejected connection: {description}"
           )));
         }
-        ClientSessionEvent::PlaybackRequestAccepted { .. } => {
+        ClientEvent::PlaybackRequestAccepted { .. } => {
           let connection_id = play.next_connection_id.fetch_add(1, Ordering::Relaxed);
           play.connection_id.store(connection_id, Ordering::Release);
           gst::info!(CAT, "RTMP server accepted playback");
@@ -1183,17 +1166,17 @@ async fn process_client_results(
             return Err(SessionFailure::error("listener is shutting down"));
           }
         }
-        ClientSessionEvent::VideoDataReceived {
+        ClientEvent::VideoDataReceived {
           data, timestamp, ..
         } => {
           play.on_media(FLV_TAG_VIDEO, timestamp.value, &data).await?;
         }
-        ClientSessionEvent::AudioDataReceived {
+        ClientEvent::AudioDataReceived {
           data, timestamp, ..
         } => {
           play.on_media(FLV_TAG_AUDIO, timestamp.value, &data).await?;
         }
-        ClientSessionEvent::StreamMetadataReceived { message, .. } => {
+        ClientEvent::StreamDataReceived { message, .. } => {
           play
             .on_media(
               FLV_TAG_SCRIPT_DATA,
@@ -1202,7 +1185,12 @@ async fn process_client_results(
             )
             .await?;
         }
-        ClientSessionEvent::PlaybackFinished { status, .. } => {
+        ClientEvent::PlaybackRequestRejected { status, .. } => {
+          return Err(SessionFailure::error(format!(
+            "RTMP playback rejected: {status:?}"
+          )));
+        }
+        ClientEvent::PlaybackFinished { status, .. } => {
           gst::info!(
             CAT,
             "RTMP server ended playback ({})",
@@ -1210,7 +1198,7 @@ async fn process_client_results(
           );
           return Ok(false);
         }
-        ClientSessionEvent::StatusReceived { status, .. } => {
+        ClientEvent::StatusReceived { status, .. } => {
           if status.code() == Some("NetStream.Play.UnpublishNotify") {
             gst::info!(CAT, "RTMP server unpublished the played stream");
             return Ok(false);
@@ -1223,17 +1211,9 @@ async fn process_client_results(
         }
         _ => {}
       },
-      ClientSessionResult::UnhandleableMessageReceived(_) => {}
+      ClientOutput::UnhandledMessage(_) => {}
       _ => {}
     }
-  }
-  if play_requested {
-    let request = session
-      .request_playback(play.stream_key.clone())
-      .map_err(|error| {
-        SessionFailure::error(format!("failed to request RTMP playback: {error:?}"))
-      })?;
-    write_client_results(stream, vec![request], output, cancellation, write_timeout).await?;
   }
   Ok(true)
 }
@@ -1453,24 +1433,18 @@ impl PublishSession {
       if !self.ensure_header().await {
         return Err(SessionFailure::error("listener is shutting down"));
       }
-      let follow_up = session.accept_request(request_id).map_err(|error| {
+      session.accept_request(request_id).map_err(|error| {
         SessionFailure::error(format!("failed to accept RTMP publish: {error:?}"))
       })?;
-      write_session_results(
-        stream,
-        follow_up,
-        &self.output,
-        &self.cancellation,
-        &self.write_timeout,
-      )
-      .await
-      .map_err(|failure| SessionFailure::error(failure.message))?;
+      flush_server(stream, session, &self.write_timeout)
+        .await
+        .map_err(|failure| SessionFailure::error(failure.message))?;
       return Ok(true);
     }
     gst::warning!(CAT, "Rejected RTMP publish for stream id {stream_id}");
     if self.keep_listening {
       self.rejected.store(true, Ordering::Release);
-      let packet = session
+      session
         .reject_request(
           request_id,
           "NetStream.Publish.Denied",
@@ -1479,17 +1453,10 @@ impl PublishSession {
         .map_err(|error| {
           SessionFailure::error(format!("failed to reject RTMP publish: {error:?}"))
         })?;
-      let _ = write_session_results(
-        stream,
-        packet,
-        &self.output,
-        &self.cancellation,
-        &self.write_timeout,
-      )
-      .await;
+      let _ = flush_server(stream, session, &self.write_timeout).await;
       return Ok(false);
     }
-    let packet = session
+    session
       .reject_request(
         request_id,
         "NetStream.Publish.Denied",
@@ -1498,14 +1465,7 @@ impl PublishSession {
       .map_err(|error| {
         SessionFailure::error(format!("failed to reject RTMP publish: {error:?}"))
       })?;
-    let _ = write_session_results(
-      stream,
-      packet,
-      &self.output,
-      &self.cancellation,
-      &self.write_timeout,
-    )
-    .await;
+    let _ = flush_server(stream, session, &self.write_timeout).await;
     Err(SessionFailure::error(
       "RTMP publisher did not match the configured application and stream key",
     ))
@@ -1515,7 +1475,7 @@ impl PublishSession {
     &mut self,
     tag_type: u8,
     timestamp: u32,
-    payload: &[u8],
+    payload: &(impl rtmpx::Segments + ?Sized),
   ) -> Result<(), SessionFailure> {
     self.writer.push_media(tag_type, timestamp, payload).await
   }
@@ -1547,9 +1507,10 @@ async fn serve_publisher(
   let mut config = ServerSessionConfig::new();
   config.window_ack_size = 2_500_000;
   config.chunk_size = 4096;
-  let (mut session, initial) = ServerSession::new(config)
+  config.session_limits.max_streams = 1;
+  config.payload_pool = Some(rtmpx::PayloadPool::default());
+  let mut session = ServerSession::new(config)
     .map_err(|error| SessionFailure::error(format!("failed to create RTMP session: {error:?}")))?;
-  debug_assert!(initial.is_empty(), "server must not write before connect");
   let mut publish = PublishSession::new(
     output.clone(),
     cancellation.clone(),
@@ -1561,13 +1522,11 @@ async fn serve_publisher(
     publish_ids,
   );
   if !carry.is_empty() {
-    let results = session.handle_input(&carry).map_err(|error| {
-      SessionFailure::error(format!("publisher sent unreadable RTMP: {error:?}"))
-    })?;
+    let mut results = Bytes::from(carry);
     if !process_session_results(
       &mut session,
       &mut stream,
-      results,
+      &mut results,
       &mut publish,
       output,
       cancellation,
@@ -1578,7 +1537,7 @@ async fn serve_publisher(
       return Ok(true);
     }
   }
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     let n = match read_session_chunk(&mut stream, &mut read_buf, cancellation, &read_timeout).await
     {
@@ -1593,13 +1552,11 @@ async fn serve_publisher(
     if n == 0 {
       return Ok(false);
     }
-    let results = session.handle_input(&read_buf[..n]).map_err(|error| {
-      SessionFailure::error(format!("publisher sent unreadable RTMP: {error:?}"))
-    })?;
+    let mut results = read_buf.split().freeze();
     if !process_session_results(
       &mut session,
       &mut stream,
-      results,
+      &mut results,
       &mut publish,
       output,
       cancellation,
@@ -1612,45 +1569,41 @@ async fn serve_publisher(
   }
 }
 
-/// Handle one batch of sans-I/O session results: write outbound packets and
+/// Pull server session outputs: write outbound packets and
 /// react to raised events. Returns `Ok(true)` to keep reading, `Ok(false)`
 /// when the publisher cleanly finished (unpublished).
 async fn process_session_results(
   session: &mut ServerSession,
   stream: &mut RtmpStream,
-  results: Vec<ServerSessionResult>,
+  results: &mut Bytes,
   publish: &mut PublishSession,
-  output: &flume::Sender<WorkerOutput>,
-  cancellation: &CancellationToken,
+  _output: &flume::Sender<WorkerOutput>,
+  _cancellation: &CancellationToken,
   write_timeout: &Option<Duration>,
 ) -> Result<bool, SessionFailure> {
-  for result in results {
+  while let Some(result) = session
+    .receive(results)
+    .map_err(|e| SessionFailure::error(format!("invalid RTMP input: {e}")))?
+  {
     match result {
-      ServerSessionResult::OutboundResponse(packet) => {
-        write_session_results(
-          stream,
-          vec![ServerSessionResult::OutboundResponse(packet)],
-          output,
-          cancellation,
-          write_timeout,
-        )
-        .await?;
+      ServerOutput::Packet(packet) => {
+        crate::common::write_packet(stream, packet, write_timeout).await?;
       }
-      ServerSessionResult::RaisedEvent(event) => match event {
-        ServerSessionEvent::ConnectionRequested {
+      ServerOutput::Event(event) => match event {
+        ServerEvent::ConnectionRequested {
           request_id,
           app_name,
           ..
         } => {
           gst::info!(CAT, "Accepted RTMP connection for app '{app_name}'");
-          let follow_up = session
+          session
             .accept_request_with_properties(request_id, enhanced_rtmp_capabilities())
             .map_err(|error| {
               SessionFailure::error(format!("failed to accept RTMP connection: {error:?}"))
             })?;
-          write_session_results(stream, follow_up, output, cancellation, write_timeout).await?;
+          flush_server(stream, session, write_timeout).await?;
         }
-        ServerSessionEvent::PublishStreamRequested {
+        ServerEvent::PublishStreamRequested {
           request_id,
           app_name,
           stream_key,
@@ -1673,21 +1626,21 @@ async fn process_session_results(
             Err(failure) => return Err(failure),
           }
         }
-        ServerSessionEvent::AudioDataReceived {
+        ServerEvent::AudioDataReceived {
           data, timestamp, ..
         } => {
           publish
             .on_media(FLV_TAG_AUDIO, timestamp.value, &data)
             .await?;
         }
-        ServerSessionEvent::VideoDataReceived {
+        ServerEvent::VideoDataReceived {
           data, timestamp, ..
         } => {
           publish
             .on_media(FLV_TAG_VIDEO, timestamp.value, &data)
             .await?;
         }
-        ServerSessionEvent::StreamMetadataChanged { message, .. } => {
+        ServerEvent::StreamDataReceived { message, .. } => {
           publish
             .on_media(
               FLV_TAG_SCRIPT_DATA,
@@ -1696,20 +1649,11 @@ async fn process_session_results(
             )
             .await?;
         }
-        ServerSessionEvent::StreamDataReceived { message, .. } => {
-          publish
-            .on_media(
-              FLV_TAG_SCRIPT_DATA,
-              message.timestamp().value,
-              &message.into_payload(),
-            )
-            .await?;
-        }
-        ServerSessionEvent::PublishStreamFinished { stream_key, .. } => {
+        ServerEvent::PublishStreamFinished { stream_key, .. } => {
           gst::info!(CAT, "RTMP stream '{stream_key}' unpublished");
           return Ok(false);
         }
-        ServerSessionEvent::PlayStreamRequested {
+        ServerEvent::PlayStreamRequested {
           request_id,
           app_name,
           ..
@@ -1718,7 +1662,7 @@ async fn process_session_results(
             CAT,
             "Rejecting RTMP play request for app '{app_name}': listener only accepts publishers"
           );
-          let packet = session
+          session
             .reject_request(
               request_id,
               "NetStream.Play.Failed",
@@ -1727,7 +1671,7 @@ async fn process_session_results(
             .map_err(|error| {
               SessionFailure::error(format!("failed to reject RTMP play: {error:?}"))
             })?;
-          write_session_results(stream, packet, output, cancellation, write_timeout).await?;
+          flush_server(stream, session, write_timeout).await?;
           if publish.keep_listening {
             publish.rejected.store(true, Ordering::Release);
             return Err(SessionFailure::disconnect("RTMP play request rejected"));
@@ -1738,7 +1682,7 @@ async fn process_session_results(
         }
         _ => {}
       },
-      ServerSessionResult::UnhandleableMessageReceived(_) => {}
+      ServerOutput::UnhandledMessage(_) => {}
       _ => {}
     }
   }

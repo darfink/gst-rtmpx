@@ -260,7 +260,7 @@ fn complete_tags(bytes: &[u8]) -> Vec<(u8, u32, Vec<u8>)> {
 /// attached (bytes queued while nobody listens are stale by design and are
 /// never resent), and the stream ends by shutting the sink down, which
 /// drops the player connection so src-play emits EOS. Pushing EOS into a
-/// listen-mode sink is a no-op for the player, so the test does not do that.
+/// listen-mode sink also completes playback; this test checks connection shutdown.
 #[test]
 fn rtmps_sink_listen_serves_tls_player() {
   init();
@@ -268,12 +268,8 @@ fn rtmps_sink_listen_serves_tls_player() {
   let (body, expected) = canned_stream();
   let chunks = awkward_chunks(&body);
 
-  // The serve path skips script tags (the server side has no raw AMF send),
-  // so the player must receive exactly the audio/video tags.
-  let expected_media: Vec<(u8, u32, Vec<u8>)> = expected
-    .into_iter()
-    .filter(|(tag_type, _, _)| *tag_type != 18)
-    .collect();
+  // Both sink modes preserve script data alongside audio and video.
+  let expected_media = expected;
 
   let mut sink = gst_check::Harness::new_empty();
   sink.add_parse(&format!(
@@ -294,7 +290,8 @@ fn rtmps_sink_listen_serves_tls_player() {
     src.play();
     let mut out = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
-    while complete_tags(&out) != want {
+    // Playback begins with sample-access and data-start script messages.
+    while complete_tags(&out).get(2..) != Some(want.as_slice()) {
       assert!(
         Instant::now() < deadline,
         "timed out waiting for TLS media: got {} of {} tags ({} bytes)",
@@ -347,7 +344,13 @@ fn rtmps_sink_listen_serves_tls_player() {
     .expect("sink must shut down");
 
   let (out, saw_eos) = player.join().expect("player thread must finish");
-  assert_eq!(parse_tags(&out), expected_media);
+  let tags = parse_tags(&out);
+  for (tag, name) in tags[..2].iter().zip(["|RtmpSampleAccess", "onStatus"]) {
+    assert_eq!(tag.0, 18);
+    let values = rtmpx::amf0::deserialize(&mut tag.2.as_slice()).unwrap();
+    assert_eq!(values[0], rtmpx::amf0::Amf0Value::Utf8String(name.into()));
+  }
+  assert_eq!(&tags[2..], expected_media);
   assert!(saw_eos, "src must emit EOS after the sink shuts down");
   drop_cert(&cert, &key);
 }

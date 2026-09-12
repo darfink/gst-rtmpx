@@ -1,10 +1,7 @@
-// Shared helpers for the rtmpx plugin (rtmpxsrc / rtmpxsink).
-// The listen worker in rtmpxsrc is a direct descendant of
-// scufflertmplistensrc: same sans-I/O rtmpx ServerSession drive, same FLV
-// framing, same publisher lifecycle events (renamed to rtmpx-publish-start
-// and rtmpx-publish-end). This module holds the pieces both elements need so
-// the play-client path and the future publish path in rtmpxsink share one
-// implementation.
+// Shared transport, FLV framing, and endpoint helpers for both elements.
+// Sessions pull owned outputs; the worker owns I/O and backpressure.
+
+use bytes::{Bytes, BytesMut};
 
 use std::io;
 use std::pin::Pin;
@@ -14,10 +11,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use rtmpx::amf0::{Amf0Object, Amf0Value};
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{
-  ClientSession, ClientSessionConfig, ClientSessionResult, ServerSessionResult,
-};
+use rtmpx::handshake::{Handshake, HandshakeProgress, HandshakeRole};
+use rtmpx::sessions::{ClientOutput, ClientSession, ClientSessionConfig, ServerOutput};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -87,7 +82,11 @@ pub fn push_u24_be(output: &mut Vec<u8>, value: u32) {
   ]);
 }
 
-pub fn frame_flv_tag(tag_type: u8, timestamp: u32, payload: &[u8]) -> io::Result<Vec<u8>> {
+pub fn frame_flv_tag(
+  tag_type: u8,
+  timestamp: u32,
+  payload: &(impl rtmpx::Segments + ?Sized),
+) -> io::Result<Vec<u8>> {
   if payload.len() > 0x00ff_ffff {
     return Err(io::Error::new(
       io::ErrorKind::InvalidData,
@@ -102,7 +101,9 @@ pub fn frame_flv_tag(tag_type: u8, timestamp: u32, payload: &[u8]) -> io::Result
   push_u24_be(&mut tag, timestamp & 0x00ff_ffff);
   tag.push((timestamp >> 24) as u8);
   push_u24_be(&mut tag, 0);
-  tag.extend_from_slice(payload);
+  for index in 0..payload.segment_count() {
+    tag.extend_from_slice(payload.segment(index));
+  }
   tag.extend_from_slice(&(11 + payload_len).to_be_bytes());
   Ok(tag)
 }
@@ -209,7 +210,7 @@ pub async fn client_handshake(
   cancellation: &CancellationToken,
   handshake_timeout: &Option<Duration>,
 ) -> Result<Vec<u8>, SessionFailure> {
-  let mut handshake = Handshake::new(PeerType::Client);
+  let mut handshake = Handshake::new(HandshakeRole::Client);
   let outbound = handshake
     .generate_outbound_p0_and_p1()
     .map_err(|error| SessionFailure::error(format!("failed to start RTMP handshake: {error:?}")))?;
@@ -243,7 +244,7 @@ pub async fn server_handshake(
   cancellation: &CancellationToken,
   handshake_timeout: &Option<Duration>,
 ) -> Result<Vec<u8>, SessionFailure> {
-  let handshake = Handshake::new(PeerType::Server);
+  let handshake = Handshake::new(HandshakeRole::Server);
   handshake_loop(
     stream,
     cancellation,
@@ -261,7 +262,7 @@ async fn handshake_loop(
   mut handshake: Handshake,
   peer_label: &str,
 ) -> Result<Vec<u8>, SessionFailure> {
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = [0u8; 16 * 1024];
   loop {
     let read_now = async {
       if let Some(limit) = handshake_timeout {
@@ -303,12 +304,12 @@ async fn handshake_loop(
       .process_bytes(&read_buf[..n])
       .map_err(|error| SessionFailure::error(format!("{handshake_error}: {error:?}")))?
     {
-      HandshakeProcessResult::InProgress { response_bytes } => {
+      HandshakeProgress::InProgress { response_bytes } => {
         if !response_bytes.is_empty() {
           write_handshake_response(stream, &response_bytes, peer_label).await?;
         }
       }
-      HandshakeProcessResult::Completed {
+      HandshakeProgress::Completed {
         response_bytes,
         remaining_bytes,
       } => {
@@ -342,98 +343,69 @@ async fn write_handshake_response(
   Ok(())
 }
 
-/// Write outbound client session packets with a per-write timeout.
-pub async fn write_client_results(
-  stream: &mut RtmpStream,
-  results: Vec<ClientSessionResult>,
-  _output: &flume::Sender<WorkerOutput>,
-  _cancellation: &CancellationToken,
+/// Write a packet without coalescing its payload, retaining short-write progress.
+/// The deadline includes flushing TLS buffers. A timed-out write closes the connection.
+pub async fn write_packet(
+  stream: &mut (impl AsyncWrite + Unpin),
+  mut packet: rtmpx::Packet,
   write_timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
-  let mut wrote = false;
-  for result in results {
-    if let ClientSessionResult::OutboundResponse(packet) = result {
-      if let Some(limit) = write_timeout {
-        tokio::time::timeout(*limit, stream.write_all(&packet.bytes))
-          .await
-          .map_err(|_| {
-            SessionFailure::disconnect(format!("timed out after {limit:?} writing RTMP request"))
-          })?
-          .map_err(|error| {
-            if is_client_io_error(&error) {
-              SessionFailure::disconnect(format!("RTMP connection lost while writing: {error}"))
-            } else {
-              SessionFailure::error(format!("failed to write RTMP request: {error}"))
-            }
-          })?;
-      } else {
-        stream.write_all(&packet.bytes).await.map_err(|error| {
-          if is_client_io_error(&error) {
-            SessionFailure::disconnect(format!("RTMP connection lost while writing: {error}"))
-          } else {
-            SessionFailure::error(format!("failed to write RTMP request: {error}"))
-          }
-        })?;
+  let write = async {
+    while !packet.is_complete() {
+      let mut slices = [io::IoSlice::new(&[]); 32];
+      let count = packet.io_slices(&mut slices);
+      match stream.write_vectored(&slices[..count]).await {
+        Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+        Ok(n) => packet.advance(n),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+        Err(error) => return Err(error),
       }
-      wrote = true;
     }
-  }
-  if wrote {
-    stream.flush().await.map_err(|error| {
-      if is_client_io_error(&error) {
-        SessionFailure::disconnect(format!("RTMP connection lost while writing: {error}"))
-      } else {
-        SessionFailure::error(format!("failed to write RTMP request: {error}"))
-      }
-    })?;
+    stream.flush().await
+  };
+  let result = match write_timeout {
+    Some(limit) => tokio::time::timeout(*limit, write).await.map_err(|_| {
+      SessionFailure::disconnect(format!("timed out after {limit:?} writing RTMP packet"))
+    })?,
+    None => write.await,
+  };
+  result.map_err(|error| {
+    if is_client_io_error(&error) {
+      SessionFailure::disconnect(format!("RTMP connection lost while writing: {error}"))
+    } else {
+      SessionFailure::error(format!("failed to write RTMP packet: {error}"))
+    }
+  })
+}
+
+/// Flush queued control responses after a local action, before reading more input.
+pub async fn flush_client(
+  stream: &mut RtmpStream,
+  session: &mut ClientSession,
+  timeout: &Option<Duration>,
+) -> Result<(), SessionFailure> {
+  while let Some(output) = session
+    .receive(&mut Bytes::new())
+    .map_err(|e| SessionFailure::error(format!("RTMP output failed: {e}")))?
+  {
+    if let ClientOutput::Packet(packet) = output {
+      write_packet(stream, packet, timeout).await?;
+    }
   }
   Ok(())
 }
-
-/// Write outbound server session packets with a per-write timeout.
-pub async fn write_session_results(
+pub async fn flush_server(
   stream: &mut RtmpStream,
-  results: Vec<ServerSessionResult>,
-  _output: &flume::Sender<WorkerOutput>,
-  _cancellation: &CancellationToken,
-  write_timeout: &Option<Duration>,
+  session: &mut rtmpx::sessions::ServerSession,
+  timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
-  let mut wrote = false;
-  for result in results {
-    if let ServerSessionResult::OutboundResponse(packet) = result {
-      if let Some(limit) = write_timeout {
-        tokio::time::timeout(*limit, stream.write_all(&packet.bytes))
-          .await
-          .map_err(|_| {
-            SessionFailure::disconnect(format!("timed out after {limit:?} writing RTMP response"))
-          })?
-          .map_err(|error| {
-            if is_client_io_error(&error) {
-              SessionFailure::disconnect(format!("RTMP connection lost while writing: {error}"))
-            } else {
-              SessionFailure::error(format!("failed to write RTMP response: {error}"))
-            }
-          })?;
-      } else {
-        stream.write_all(&packet.bytes).await.map_err(|error| {
-          if is_client_io_error(&error) {
-            SessionFailure::disconnect(format!("RTMP connection lost while writing: {error}"))
-          } else {
-            SessionFailure::error(format!("failed to write RTMP response: {error}"))
-          }
-        })?;
-      }
-      wrote = true;
+  while let Some(output) = session
+    .receive(&mut Bytes::new())
+    .map_err(|e| SessionFailure::error(format!("RTMP output failed: {e}")))?
+  {
+    if let ServerOutput::Packet(packet) = output {
+      write_packet(stream, packet, timeout).await?;
     }
-  }
-  if wrote {
-    stream.flush().await.map_err(|error| {
-      if is_client_io_error(&error) {
-        SessionFailure::disconnect(format!("RTMP connection lost while writing: {error}"))
-      } else {
-        SessionFailure::error(format!("failed to write RTMP response: {error}"))
-      }
-    })?;
   }
   Ok(())
 }
@@ -673,6 +645,25 @@ impl AsyncWrite for RtmpStream {
       RtmpStream::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
       RtmpStream::TlsClient(stream) => Pin::new(stream).poll_write(cx, buf),
       RtmpStream::TlsServer(stream) => Pin::new(stream).poll_write(cx, buf),
+    }
+  }
+
+  fn is_write_vectored(&self) -> bool {
+    match self {
+      Self::Plain(s) => s.is_write_vectored(),
+      Self::TlsClient(s) => s.is_write_vectored(),
+      Self::TlsServer(s) => s.is_write_vectored(),
+    }
+  }
+  fn poll_write_vectored(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &[io::IoSlice<'_>],
+  ) -> Poll<io::Result<usize>> {
+    match self.get_mut() {
+      Self::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+      Self::TlsClient(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+      Self::TlsServer(s) => Pin::new(s).poll_write_vectored(cx, bufs),
     }
   }
 
@@ -926,9 +917,10 @@ pub fn new_client_session(tc_url: String) -> Result<ClientSession, SessionFailur
   config.window_ack_size = 2_500_000;
   config.chunk_size = 4096;
   config.tc_url = Some(tc_url);
-  let (session, initial) = ClientSession::new(config)
+  config.session_limits.max_streams = 1;
+  config.payload_pool = Some(rtmpx::PayloadPool::default());
+  let session = ClientSession::new(config)
     .map_err(|error| SessionFailure::error(format!("failed to create RTMP session: {error:?}")))?;
-  debug_assert!(initial.is_empty(), "client must not write before connect");
   Ok(session)
 }
 
@@ -937,19 +929,20 @@ pub fn new_client_session(tc_url: String) -> Result<ClientSession, SessionFailur
 /// stays identical everywhere.
 pub async fn read_session_chunk(
   stream: &mut RtmpStream,
-  buf: &mut [u8],
+  buf: &mut BytesMut,
   cancellation: &CancellationToken,
   read_timeout: &Option<Duration>,
 ) -> Result<usize, SessionFailure> {
+  buf.reserve(16 * 1024);
   let read_now = async {
     if let Some(limit) = read_timeout {
-      tokio::time::timeout(*limit, stream.read(buf))
+      tokio::time::timeout(*limit, (&mut *stream).take(16 * 1024).read_buf(buf))
         .await
         .map_err(|_| {
           SessionFailure::disconnect(format!("timed out after {limit:?} waiting for RTMP input"))
         })
     } else {
-      Ok(stream.read(buf).await)
+      Ok((&mut *stream).take(16 * 1024).read_buf(buf).await)
     }
   };
   tokio::select! {
@@ -1006,7 +999,7 @@ impl FlvTagWriter {
     &mut self,
     tag_type: u8,
     timestamp: u32,
-    payload: &[u8],
+    payload: &(impl rtmpx::Segments + ?Sized),
   ) -> Result<(), SessionFailure> {
     if !self.ensure_header().await {
       return Err(SessionFailure::error("listener is shutting down"));
@@ -1113,6 +1106,52 @@ impl FlvDemux {
 
 #[cfg(test)]
 mod tests {
+  #[tokio::test]
+  async fn packet_writer_preserves_bytes_across_short_writes() {
+    let payload: rtmpx::Payload = (0..5).map(|i| Bytes::from(vec![i; 257])).collect();
+    let packet = rtmpx::chunk_io::ChunkEncoder::new()
+      .encode(
+        rtmpx::messages::RawMessage {
+          timestamp: rtmpx::time::RtmpTimestamp::new(0x0100_0000),
+          type_id: 9,
+          message_stream_id: 1,
+          data: payload,
+        },
+        rtmpx::EncodeOptions::default(),
+      )
+      .unwrap();
+    let expected = packet.to_vec();
+    // Capacity seven forces writes to end inside headers and payload segments.
+    let (mut writer, mut reader) = tokio::io::duplex(7);
+    let send = async {
+      write_packet(&mut writer, packet, &Some(Duration::from_secs(5)))
+        .await
+        .unwrap();
+      writer.shutdown().await.unwrap();
+    };
+    let receive = async {
+      let mut actual = Vec::new();
+      reader.read_to_end(&mut actual).await.unwrap();
+      actual
+    };
+    let ((), actual) = tokio::join!(send, receive);
+    assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn flv_framing_accepts_segmented_payloads_without_coalescing() {
+    let payload: rtmpx::Payload = [
+      bytes::Bytes::from_static(b"one"),
+      bytes::Bytes::from_static(b"two"),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+      frame_flv_tag(9, 1234, &payload).unwrap(),
+      frame_flv_tag(9, 1234, b"onetwo").unwrap()
+    );
+  }
+
   use super::*;
 
   #[test]

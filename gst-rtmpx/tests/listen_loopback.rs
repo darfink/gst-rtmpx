@@ -9,9 +9,9 @@ use gst::prelude::*;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use rtmpx::amf0::{Amf0Object, Amf0Value};
-use rtmpx::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rtmpx::sessions::{
+use rtmpx_legacy::amf0::{Amf0Object, Amf0Value};
+use rtmpx_legacy::handshake::{Handshake, HandshakeProcessResult, PeerType};
+use rtmpx_legacy::sessions::{
   ClientSession, ClientSessionConfig, ClientSessionEvent, ClientSessionResult, PublishRequestType,
 };
 use std::fmt::Write as _;

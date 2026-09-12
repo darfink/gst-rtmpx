@@ -121,10 +121,7 @@ If you installed GStreamer from its official macOS framework installer (not Home
 export PKG_CONFIG_PATH=/Library/Frameworks/GStreamer.framework/Versions/Current/lib/pkgconfig:$PKG_CONFIG_PATH
 ```
 
-The `rtmpx` protocol dependency is fetched from GitHub as a git dependency
-(pinned via `Cargo.lock`). If your git setup rewrites `https://github.com/`
-to SSH, cargo already uses the git CLI for fetching (see
-`.cargo/config.toml`), so your normal GitHub SSH credentials apply.
+The plugin uses RTMPX 3 from crates.io, pinned by `Cargo.lock`.
 
 ## Testing
 

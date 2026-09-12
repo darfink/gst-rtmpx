@@ -497,7 +497,8 @@ dependencies = [
  "gstreamer-base",
  "gstreamer-check",
  "rcgen",
- "rtmpx",
+ "rtmpx 2.0.0",
+ "rtmpx 3.0.0",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -966,6 +967,22 @@ name = "rtmpx"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4750264eab39cc6ae846944a14893c1fb69caa4c84a0e5883dfc1dc76014199b"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "hmac",
+ "indexmap",
+ "rand",
+ "serde",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "rtmpx"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddfbafc58debf10426f7bca12f4f9fadebbc39d3bcf05a431ad6af0e039c6ab7"
 dependencies = [
  "byteorder",
  "bytes",

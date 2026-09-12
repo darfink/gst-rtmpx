@@ -80,6 +80,19 @@ disconnects until EOS/shutdown. Same bind rules as the source: IP literal, port 
 allocates and updates `uri`, missing app/key accepts any. A failed TLS handshake
 ends that player, not the listener.
 
+### Protocol integration
+
+The plugin uses RTMPX 3 from crates.io. Each connection drains protocol outputs
+one at a time and uses stream handles for media and stream teardown.
+Outbound packets use vectored writes and retain their cursor across partial writes.
+Inbound reads use owned buffers; received segments go directly into FLV framing
+without an intermediate contiguous RTMP payload.
+
+The GStreamer FLV boundary still allocates and copies data. TLS also has its own
+buffering. These changes reduce protocol overhead; the whole plugin is not allocation-free.
+Both sink modes forward audio, video, and script-data tags.
+The source preserves received script data, including playback startup messages.
+
 ### Layout
 
 - `src/rtmpxsrc/`: dual-mode source (listen worker + play worker).
@@ -88,6 +101,9 @@ ends that player, not the listener.
   worker-channel helpers, capabilities map, TLS stream wrappers.
 
 ### Tests
+
+The raw loopback peers use released RTMPX 2 to check wire compatibility independently
+of the production RTMPX 3 dependency.
 
 - `tests/listen_loopback.rs`: source listen round-trip over real TCP.
 - `tests/sink_listen.rs`: sink listen mode against a raw protocol player.

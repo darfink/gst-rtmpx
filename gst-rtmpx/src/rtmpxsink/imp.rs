@@ -19,11 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rtmpx::sessions::{
-  ClientSession, ClientSessionEvent, ClientSessionResult, DataMessage, DataMessageType,
-  PublishRequestType, ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
-  StreamId,
+  ClientEvent, ClientOutput, ClientSession, DataMessage, DataMessageType, PublishMode, ServerEvent,
+  ServerOutput, ServerSession, ServerSessionConfig, StreamHandle,
 };
 use rtmpx::time::RtmpTimestamp;
 
@@ -38,10 +37,9 @@ use tokio_util::sync::CancellationToken;
 use crate::common::{
   CAT_SINK, ClientEndpoint, FLV_TAG_AUDIO, FLV_TAG_SCRIPT_DATA, FLV_TAG_VIDEO, FlvDemux, FlvTag,
   RtmpStream, SessionFailure, WORKER_START_TIMEOUT, accept_tls_server, bracketed_host,
-  client_handshake, enhanced_rtmp_capabilities, is_client_io_error, nanoseconds_timeout,
+  client_handshake, enhanced_rtmp_capabilities, flush_client, flush_server, nanoseconds_timeout,
   new_client_session, parse_rtmp_uri, read_session_chunk, require_uri, resolve_client_endpoint,
-  resolve_tls_acceptor, server_handshake, tcp_connect, wrap_tls_client, write_client_results,
-  write_session_results,
+  resolve_tls_acceptor, server_handshake, tcp_connect, wrap_tls_client,
 };
 
 const DEFAULT_MODE: &str = "publish";
@@ -765,35 +763,22 @@ async fn publish_until_done(
   );
   let carry = client_handshake(&mut stream, cancellation, &handshake_timeout).await?;
   let mut session = new_client_session(endpoint.tc_url.clone())?;
-  // write_client_results needs a WorkerOutput channel it never uses; hand it
-  // a dummy one so the sink shares the exact helper with rtmpxsrc.
-  let (dummy_output, _dummy_rx) = flume::bounded(1);
-  let connect = session
-    .request_connection_with_properties(endpoint.app.clone(), enhanced_rtmp_capabilities())
+  session
+    .connect_with_properties(endpoint.app.clone(), enhanced_rtmp_capabilities())
     .map_err(|error| {
       SessionFailure::error(format!("failed to request RTMP connection: {error:?}"))
     })?;
-  write_client_results(
-    &mut stream,
-    vec![connect],
-    &dummy_output,
-    cancellation,
-    &write_timeout,
-  )
-  .await?;
+  flush_client(&mut stream, &mut session, &write_timeout).await?;
   // The handshake carry can already contain the server's connect reply
   // (WindowAck/SetChunkSize/_result). If it does, the connection is already
   // accepted and we must not wait for a second accept that never arrives.
   let mut connected = false;
   if !carry.is_empty() {
-    let results = session
-      .handle_input(&carry)
-      .map_err(|error| SessionFailure::error(format!("server sent unreadable RTMP: {error:?}")))?;
+    let mut results = Bytes::from(carry);
     connected = drain_connect_results(
       &mut session,
       &mut stream,
-      results,
-      &dummy_output,
+      &mut results,
       cancellation,
       &write_timeout,
     )
@@ -803,7 +788,6 @@ async fn publish_until_done(
     wait_for_connection(
       &mut session,
       &mut stream,
-      &dummy_output,
       cancellation,
       &read_timeout,
       &write_timeout,
@@ -811,20 +795,12 @@ async fn publish_until_done(
     .await?;
   }
   let publish = session
-    .request_publishing(endpoint.stream_key.clone(), PublishRequestType::Live)
+    .publish(&endpoint.stream_key, PublishMode::Live)
     .map_err(|error| SessionFailure::error(format!("failed to request RTMP publish: {error:?}")))?;
-  write_client_results(
-    &mut stream,
-    vec![publish],
-    &dummy_output,
-    cancellation,
-    &write_timeout,
-  )
-  .await?;
+  flush_client(&mut stream, &mut session, &write_timeout).await?;
   wait_for_publish_accept(
     &mut session,
     &mut stream,
-    &dummy_output,
     cancellation,
     &read_timeout,
     &write_timeout,
@@ -840,9 +816,9 @@ async fn publish_until_done(
   }
   run_publish_loop(
     &mut session,
+    publish,
     &mut stream,
     data_receiver,
-    &dummy_output,
     cancellation,
     &read_timeout,
     &write_timeout,
@@ -853,12 +829,11 @@ async fn publish_until_done(
 async fn wait_for_connection(
   session: &mut ClientSession,
   stream: &mut RtmpStream,
-  dummy_output: &flume::Sender<crate::common::WorkerOutput>,
   cancellation: &CancellationToken,
   read_timeout: &Option<Duration>,
   write_timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     let n = read_session_chunk(stream, &mut read_buf, cancellation, read_timeout).await?;
     if n == 0 {
@@ -866,65 +841,43 @@ async fn wait_for_connection(
         "RTMP server closed the connection while connecting",
       ));
     }
-    let results = session
-      .handle_input(&read_buf[..n])
-      .map_err(|error| SessionFailure::error(format!("server sent unreadable RTMP: {error:?}")))?;
-    if drain_connect_results(
-      session,
-      stream,
-      results,
-      dummy_output,
-      cancellation,
-      write_timeout,
-    )
-    .await?
-    {
+    let mut results = read_buf.split().freeze();
+    if drain_connect_results(session, stream, &mut results, cancellation, write_timeout).await? {
       return Ok(());
     }
   }
 }
 
 async fn drain_connect_results(
-  _session: &mut ClientSession,
+  session: &mut ClientSession,
   stream: &mut RtmpStream,
-  results: Vec<ClientSessionResult>,
-  dummy_output: &flume::Sender<crate::common::WorkerOutput>,
-  cancellation: &CancellationToken,
+  results: &mut Bytes,
+  _cancellation: &CancellationToken,
   write_timeout: &Option<Duration>,
 ) -> Result<bool, SessionFailure> {
-  // rtmpx emits [WindowAck, ConnectionAccepted event, SetChunkSize] for a
-  // connect accept. The SetChunkSize packet MUST hit the wire: it tells the
-  // server we now send 4096-byte chunks. Returning early on the event drops
-  // it, leaving our serializer at 4096 while the server still reads 128.
-  // The server then parses video payload bytes as chunk headers, which is
-  // exactly the NoPreviousChunkOnStream { csid: 33 } failure seen in the
-  // sink->src smoke test. Drain the whole batch before reporting accepted.
+  // Drain every queued control packet before sending media.
   let mut accepted = false;
-  for result in results {
+  while let Some(result) = session
+    .receive(results)
+    .map_err(|e| SessionFailure::error(format!("invalid RTMP input: {e}")))?
+  {
     match result {
-      ClientSessionResult::OutboundResponse(packet) => {
-        write_client_results(
-          stream,
-          vec![ClientSessionResult::OutboundResponse(packet)],
-          dummy_output,
-          cancellation,
-          write_timeout,
-        )
-        .await?;
+      ClientOutput::Packet(packet) => {
+        crate::common::write_packet(stream, packet, write_timeout).await?;
       }
-      ClientSessionResult::RaisedEvent(event) => match event {
-        ClientSessionEvent::ConnectionRequestAccepted { .. } => {
+      ClientOutput::Event(event) => match event {
+        ClientEvent::ConnectionRequestAccepted { .. } => {
           gst::info!(CAT_SINK, "RTMP server accepted connection");
           accepted = true;
         }
-        ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
+        ClientEvent::ConnectionRequestRejected { description, .. } => {
           return Err(SessionFailure::error(format!(
             "RTMP server rejected connection: {description}"
           )));
         }
         _ => {}
       },
-      ClientSessionResult::UnhandleableMessageReceived(_) => {}
+      ClientOutput::UnhandledMessage(_) => {}
       _ => {}
     }
   }
@@ -934,12 +887,11 @@ async fn drain_connect_results(
 async fn wait_for_publish_accept(
   session: &mut ClientSession,
   stream: &mut RtmpStream,
-  dummy_output: &flume::Sender<crate::common::WorkerOutput>,
   cancellation: &CancellationToken,
   read_timeout: &Option<Duration>,
   write_timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     let n = read_session_chunk(stream, &mut read_buf, cancellation, read_timeout).await?;
     if n == 0 {
@@ -947,35 +899,33 @@ async fn wait_for_publish_accept(
         "RTMP server closed the connection while requesting publish",
       ));
     }
-    let results = session
-      .handle_input(&read_buf[..n])
-      .map_err(|error| SessionFailure::error(format!("server sent unreadable RTMP: {error:?}")))?;
-    // Same drain-fully rule as the connect path: finish writing every
-    // OutboundResponse in this batch before reporting publish-accepted, so
-    // a trailing packet can never be dropped by an early return.
+    let mut results = read_buf.split().freeze();
+    // Drain queued control packets before allowing the first media send.
     let mut accepted = false;
-    for result in results {
+    while let Some(result) = session
+      .receive(&mut results)
+      .map_err(|e| SessionFailure::error(format!("invalid RTMP input: {e}")))?
+    {
       match result {
-        ClientSessionResult::OutboundResponse(packet) => {
-          write_client_results(
-            stream,
-            vec![ClientSessionResult::OutboundResponse(packet)],
-            dummy_output,
-            cancellation,
-            write_timeout,
-          )
-          .await?;
+        ClientOutput::Packet(packet) => {
+          crate::common::write_packet(stream, packet, write_timeout).await?;
         }
-        ClientSessionResult::RaisedEvent(event) => match event {
-          ClientSessionEvent::PublishRequestAccepted { .. } => accepted = true,
-          ClientSessionEvent::ConnectionRequestRejected { description, .. } => {
+        ClientOutput::Event(event) => match event {
+          ClientEvent::PublishRequestAccepted { .. } => accepted = true,
+          ClientEvent::PublishRequestRejected { status, .. }
+          | ClientEvent::PublishingFinished { status, .. } => {
+            return Err(SessionFailure::error(format!(
+              "RTMP publish rejected: {status:?}"
+            )));
+          }
+          ClientEvent::ConnectionRequestRejected { description, .. } => {
             return Err(SessionFailure::error(format!(
               "RTMP server rejected publish: {description}"
             )));
           }
           _ => {}
         },
-        ClientSessionResult::UnhandleableMessageReceived(_) => {}
+        ClientOutput::UnhandledMessage(_) => {}
         _ => {}
       }
     }
@@ -985,81 +935,61 @@ async fn wait_for_publish_accept(
   }
 }
 
-/// Turn demuxed FLV tags into rtmpx publish results. The demuxer itself
-/// (header handling, partial-tag buffering) lives in common so both the
-/// unit tests and any future muxer share it; this only maps tag types to
-/// the matching publish call.
-fn publish_flv_tags(
+/// Encode one FLV body without allocating a batch of outbound packets.
+fn publish_flv_tag(
   session: &mut ClientSession,
-  tags: Vec<crate::common::FlvTag>,
-) -> Result<Vec<ClientSessionResult>, SessionFailure> {
-  let mut results = Vec::with_capacity(tags.len());
-  for tag in tags {
-    let timestamp = RtmpTimestamp::new(tag.timestamp);
-    let result = match tag.tag_type {
-      FLV_TAG_AUDIO => session
-        .publish_audio_data(Bytes::from(tag.payload), timestamp, false)
-        .map_err(|error| {
-          SessionFailure::error(format!("failed to publish audio data: {error:?}"))
-        })?,
-      FLV_TAG_VIDEO => session
-        .publish_video_data(Bytes::from(tag.payload), timestamp, false)
-        .map_err(|error| {
-          SessionFailure::error(format!("failed to publish video data: {error:?}"))
-        })?,
-      FLV_TAG_SCRIPT_DATA => session
-        .publish_data(DataMessage::new(
-          DataMessageType::Amf0,
-          timestamp,
-          Bytes::from(tag.payload),
-        ))
-        .map_err(|error| {
-          SessionFailure::error(format!("failed to publish script data: {error:?}"))
-        })?,
-      other => {
-        gst::debug!(CAT_SINK, "Ignoring FLV tag type {other}");
-        continue;
-      }
-    };
-    results.push(result);
+  publishing: StreamHandle,
+  tag: crate::common::FlvTag,
+) -> Result<Option<rtmpx::Packet>, SessionFailure> {
+  let timestamp = RtmpTimestamp::new(tag.timestamp);
+  let packet = match tag.tag_type {
+    FLV_TAG_AUDIO => {
+      session.send_audio(publishing, tag.payload, timestamp, rtmpx::DropPolicy::Never)
+    }
+    FLV_TAG_VIDEO => {
+      session.send_video(publishing, tag.payload, timestamp, rtmpx::DropPolicy::Never)
+    }
+    FLV_TAG_SCRIPT_DATA => session.send_data(
+      publishing,
+      DataMessage::new(DataMessageType::Amf0, timestamp, tag.payload),
+    ),
+    _ => return Ok(None),
   }
-  Ok(results)
+  .map_err(|error| SessionFailure::error(format!("failed to publish FLV tag: {error}")))?;
+  Ok(Some(packet))
 }
 
 async fn run_publish_loop(
   session: &mut ClientSession,
+  publishing: StreamHandle,
   stream: &mut RtmpStream,
   data_receiver: &flume::Receiver<Vec<u8>>,
-  dummy_output: &flume::Sender<crate::common::WorkerOutput>,
   cancellation: &CancellationToken,
   read_timeout: &Option<Duration>,
   write_timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
   let mut demux = FlvDemux::default();
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     tokio::select! {
       _ = cancellation.cancelled() => {
-        let stopping = session.stop_publishing().unwrap_or_default();
-        if !stopping.is_empty() {
-          let _ = write_client_results(stream, stopping, dummy_output, cancellation, write_timeout).await;
-        }
+        let _ = session.delete_stream(publishing);
+        let _ = flush_client(stream, session, write_timeout).await;
         let _ = stream.shutdown().await;
         return Err(SessionFailure::error("sink is shutting down"));
       }
       incoming = data_receiver.recv_async() => match incoming {
         Ok(chunk) => {
           let tags = demux.push(&chunk);
-          let results = publish_flv_tags(session, tags)?;
-          if !results.is_empty() {
-            write_client_results(stream, results, dummy_output, cancellation, write_timeout).await?;
+          for tag in tags {
+            if let Some(packet) = publish_flv_tag(session, publishing, tag)? {
+              crate::common::write_packet(stream, packet, write_timeout).await?;
+            }
           }
         }
         Err(flume::RecvError::Disconnected) => {
-          let stopping = session.stop_publishing().unwrap_or_default();
-          if !stopping.is_empty() {
-            let _ = write_client_results(stream, stopping, dummy_output, cancellation, write_timeout).await;
-          }
+          let _ = session.delete_stream(publishing);
+          let _ = flush_client(stream, session, write_timeout).await;
           let _ = stream.shutdown().await;
           return Ok(());
         }
@@ -1069,26 +999,20 @@ async fn run_publish_loop(
         if n == 0 {
           return Err(SessionFailure::disconnect("RTMP server closed the connection"));
         }
-        let results = session.handle_input(&read_buf[..n]).map_err(|error| {
-          SessionFailure::error(format!("server sent unreadable RTMP: {error:?}"))
-        })?;
-        for result in results {
+        let mut results = read_buf.split().freeze();
+        while let Some(result) = session.receive(&mut results).map_err(|e| SessionFailure::error(format!("invalid RTMP input: {e}")))? {
           match result {
-            ClientSessionResult::OutboundResponse(packet) => {
-              write_client_results(
-                stream,
-                vec![ClientSessionResult::OutboundResponse(packet)],
-                dummy_output,
-                cancellation,
-                write_timeout,
-              )
-              .await?;
+            ClientOutput::Packet(packet) => {
+              crate::common::write_packet(stream, packet, write_timeout).await?;
             }
-            ClientSessionResult::RaisedEvent(event) => {
+            ClientOutput::Event(ClientEvent::PublishingFinished { status, .. }) => {
+              return Err(SessionFailure::disconnect(format!("RTMP server ended publishing: {status:?}")));
+            }
+            ClientOutput::Event(event) => {
               gst::debug!(CAT_SINK, "Ignoring RTMP client event while publishing: {event:?}");
             }
-            ClientSessionResult::UnhandleableMessageReceived(_) => {}
-      _ => {}
+            ClientOutput::UnhandledMessage(_) => {}
+            _ => {}
           }
         }
       }
@@ -1163,9 +1087,9 @@ enum PlayerOutcome {
   Shutdown,
 }
 
-/// What the pre-play pump found in one batch of session results.
+/// The outcome of processing available input before playback.
 enum PlayWait {
-  Accepted(StreamId),
+  Accepted(StreamHandle),
   Rejected,
   NeedMore,
   Gone,
@@ -1365,32 +1289,23 @@ async fn serve_one_player(
   let mut config = ServerSessionConfig::new();
   config.window_ack_size = 2_500_000;
   config.chunk_size = 4096;
-  let (mut session, initial) = match ServerSession::new(config) {
+  config.session_limits.max_streams = 1;
+  config.payload_pool = Some(rtmpx::PayloadPool::default());
+  let mut session = match ServerSession::new(config) {
     Ok(session) => session,
     Err(error) => {
       gst::warning!(CAT_SINK, "Failed to create RTMP session: {error:?}");
       return PlayerOutcome::PlayerDone;
     }
   };
-  debug_assert!(initial.is_empty(), "server must not write before connect");
-  // write_session_results needs a WorkerOutput channel it never uses;
-  // hand it a dummy one like the publish path does.
-  let (dummy_output, _dummy_rx) = flume::bounded(1);
   if !carry.is_empty() {
-    let results = match session.handle_input(&carry) {
-      Ok(results) => results,
-      Err(error) => {
-        gst::warning!(CAT_SINK, "Player sent unreadable RTMP: {error:?}");
-        return PlayerOutcome::PlayerDone;
-      }
-    };
+    let mut results = Bytes::from(carry);
     match pump_until_play(
       &mut session,
       &mut stream,
-      results,
+      &mut results,
       app_filter,
       key_filter,
-      &dummy_output,
       cancellation,
       write_timeout,
     )
@@ -1415,7 +1330,7 @@ async fn serve_one_player(
       PlayWait::NeedMore => {}
     }
   }
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     let n = match read_session_chunk(&mut stream, &mut read_buf, cancellation, read_timeout).await {
       Ok(n) => n,
@@ -1439,20 +1354,13 @@ async fn serve_one_player(
       gst::info!(CAT_SINK, "RTMP player closed the connection before play");
       return PlayerOutcome::PlayerDone;
     }
-    let results = match session.handle_input(&read_buf[..n]) {
-      Ok(results) => results,
-      Err(error) => {
-        gst::warning!(CAT_SINK, "Player sent unreadable RTMP: {error:?}");
-        return PlayerOutcome::PlayerDone;
-      }
-    };
+    let mut results = read_buf.split().freeze();
     match pump_until_play(
       &mut session,
       &mut stream,
-      results,
+      &mut results,
       app_filter,
       key_filter,
-      &dummy_output,
       cancellation,
       write_timeout,
     )
@@ -1479,7 +1387,7 @@ async fn serve_one_player(
   }
 }
 
-/// Handle one batch of session results while waiting for the play request:
+/// Pull session outputs while waiting for the play request:
 /// write outbound packets and accept or reject the play. Non-matching app
 /// or stream key is rejected and the connection is dropped so the listener
 /// keeps serving the configured stream.
@@ -1487,57 +1395,54 @@ async fn serve_one_player(
 async fn pump_until_play(
   session: &mut ServerSession,
   stream: &mut RtmpStream,
-  results: Vec<ServerSessionResult>,
+  results: &mut Bytes,
   app_filter: &Option<String>,
   key_filter: &Option<String>,
-  dummy_output: &flume::Sender<crate::common::WorkerOutput>,
-  cancellation: &CancellationToken,
+  _cancellation: &CancellationToken,
   write_timeout: &Option<Duration>,
 ) -> PlayWait {
-  for result in results {
+  let mut accepted = None;
+  loop {
+    let result = match session.receive(results) {
+      Ok(Some(result)) => result,
+      Ok(None) => break,
+      Err(error) => {
+        gst::warning!(CAT_SINK, "Invalid player RTMP: {error}");
+        return PlayWait::Gone;
+      }
+    };
     match result {
-      ServerSessionResult::OutboundResponse(packet) => {
-        if write_session_results(
-          stream,
-          vec![ServerSessionResult::OutboundResponse(packet)],
-          dummy_output,
-          cancellation,
-          write_timeout,
-        )
-        .await
-        .is_err()
+      ServerOutput::Packet(packet) => {
+        if crate::common::write_packet(stream, packet, write_timeout)
+          .await
+          .is_err()
         {
           return PlayWait::Gone;
         }
       }
-      ServerSessionResult::RaisedEvent(event) => match event {
-        ServerSessionEvent::ConnectionRequested {
+      ServerOutput::Event(event) => match event {
+        ServerEvent::ConnectionRequested {
           request_id,
           app_name,
           ..
         } => {
           gst::info!(CAT_SINK, "Accepted RTMP connection for app '{app_name}'");
-          let follow_up = match session
-            .accept_request_with_properties(request_id, enhanced_rtmp_capabilities())
-          {
-            Ok(follow_up) => follow_up,
+          match session.accept_request_with_properties(request_id, enhanced_rtmp_capabilities()) {
+            Ok(()) => {}
             Err(error) => {
               gst::warning!(CAT_SINK, "Failed to accept RTMP connection: {error:?}");
               return PlayWait::Gone;
             }
           };
-          if write_session_results(stream, follow_up, dummy_output, cancellation, write_timeout)
-            .await
-            .is_err()
-          {
+          if flush_server(stream, session, write_timeout).await.is_err() {
             return PlayWait::Gone;
           }
         }
-        ServerSessionEvent::PlayStreamRequested {
+        ServerEvent::PlayStreamRequested {
           request_id,
           app_name,
           stream_key,
-          stream_id,
+          stream: handle,
           ..
         } => {
           let allowed = app_filter
@@ -1551,46 +1456,38 @@ async fn pump_until_play(
               CAT_SINK,
               "Rejecting RTMP play for '{app_name}/{stream_key}': not the configured stream"
             );
-            let packet = match session.reject_request(
+            match session.reject_request(
               request_id,
               "NetStream.Play.Failed",
               "this endpoint only serves its configured stream",
             ) {
-              Ok(packet) => packet,
+              Ok(()) => {}
               Err(error) => {
                 gst::warning!(CAT_SINK, "Failed to reject RTMP play: {error:?}");
                 return PlayWait::Gone;
               }
             };
-            if write_session_results(stream, packet, dummy_output, cancellation, write_timeout)
-              .await
-              .is_err()
-            {
+            if flush_server(stream, session, write_timeout).await.is_err() {
               return PlayWait::Gone;
             }
             return PlayWait::Rejected;
           }
-          let follow_up = match session
-            .accept_request_with_properties(request_id, enhanced_rtmp_capabilities())
-          {
-            Ok(follow_up) => follow_up,
+          match session.accept_request_with_properties(request_id, enhanced_rtmp_capabilities()) {
+            Ok(()) => {}
             Err(error) => {
               gst::warning!(CAT_SINK, "Failed to accept RTMP play: {error:?}");
               return PlayWait::Gone;
             }
           };
-          if write_session_results(stream, follow_up, dummy_output, cancellation, write_timeout)
-            .await
-            .is_err()
-          {
+          if flush_server(stream, session, write_timeout).await.is_err() {
             return PlayWait::Gone;
           }
           gst::info!(CAT_SINK, "RTMP player is playing '{app_name}/{stream_key}'");
-          return PlayWait::Accepted(stream_id);
+          accepted = Some(handle);
         }
         // A publisher on a sink listener is as welcome as a player on a
         // src listener: reject it the same way so the port keeps serving.
-        ServerSessionEvent::PublishStreamRequested {
+        ServerEvent::PublishStreamRequested {
           request_id,
           app_name,
           ..
@@ -1599,101 +1496,61 @@ async fn pump_until_play(
             CAT_SINK,
             "Rejecting RTMP publish request for app '{app_name}': listener only serves players"
           );
-          let packet = match session.reject_request(
+          match session.reject_request(
             request_id,
             "NetStream.Publish.BadName",
             "this endpoint only serves players",
           ) {
-            Ok(packet) => packet,
+            Ok(()) => {}
             Err(error) => {
               gst::warning!(CAT_SINK, "Failed to reject RTMP publish: {error:?}");
               return PlayWait::Gone;
             }
           };
-          if write_session_results(stream, packet, dummy_output, cancellation, write_timeout)
-            .await
-            .is_err()
-          {
+          if flush_server(stream, session, write_timeout).await.is_err() {
             return PlayWait::Gone;
           }
           return PlayWait::Rejected;
         }
+        ServerEvent::PlayStreamFinished { .. } => return PlayWait::Gone,
         _ => {}
       },
-      ServerSessionResult::UnhandleableMessageReceived(_) => {}
+      ServerOutput::UnhandledMessage(_) => {}
       _ => {}
     }
   }
-  PlayWait::NeedMore
-}
-
-/// Write one server-side media packet with a per-write timeout, mapping
-/// peer-gone errors to disconnects like write_session_results does.
-async fn write_packet_bytes(
-  stream: &mut RtmpStream,
-  bytes: &[u8],
-  write_timeout: &Option<Duration>,
-) -> Result<(), SessionFailure> {
-  if let Some(limit) = write_timeout {
-    tokio::time::timeout(*limit, stream.write_all(bytes))
-      .await
-      .map_err(|_| {
-        SessionFailure::disconnect(format!("timed out after {limit:?} writing RTMP media"))
-      })?
-      .map_err(|error| {
-        if is_client_io_error(&error) {
-          SessionFailure::disconnect(format!("RTMP player went away while writing: {error}"))
-        } else {
-          SessionFailure::error(format!("failed to write RTMP media: {error}"))
-        }
-      })?;
-  } else {
-    stream.write_all(bytes).await.map_err(|error| {
-      if is_client_io_error(&error) {
-        SessionFailure::disconnect(format!("RTMP player went away while writing: {error}"))
-      } else {
-        SessionFailure::error(format!("failed to write RTMP media: {error}"))
-      }
-    })?;
-  }
-  stream.flush().await.map_err(|error| {
-    if is_client_io_error(&error) {
-      SessionFailure::disconnect(format!("RTMP player went away while writing: {error}"))
-    } else {
-      SessionFailure::error(format!("failed to write RTMP media: {error}"))
-    }
-  })
+  accepted.map_or(PlayWait::NeedMore, PlayWait::Accepted)
 }
 
 /// Send one cached sequence header to a fresh player.
 async fn send_cached_header(
   session: &mut ServerSession,
   stream: &mut RtmpStream,
-  stream_id: StreamId,
+  stream_id: StreamHandle,
   tag: &FlvTag,
   write_timeout: &Option<Duration>,
 ) -> Result<(), SessionFailure> {
   let timestamp = RtmpTimestamp::new(tag.timestamp);
   let packet = match tag.tag_type {
     FLV_TAG_VIDEO => session
-      .send_video_data(
+      .send_video(
         stream_id,
         Bytes::from(tag.payload.clone()),
         timestamp,
-        false,
+        rtmpx::DropPolicy::Never,
       )
       .map_err(|error| SessionFailure::error(format!("failed to frame video header: {error:?}")))?,
     FLV_TAG_AUDIO => session
-      .send_audio_data(
+      .send_audio(
         stream_id,
         Bytes::from(tag.payload.clone()),
         timestamp,
-        false,
+        rtmpx::DropPolicy::Never,
       )
       .map_err(|error| SessionFailure::error(format!("failed to frame audio header: {error:?}")))?,
     _ => return Ok(()),
   };
-  write_packet_bytes(stream, &packet.bytes, write_timeout).await
+  crate::common::write_packet(stream, packet, write_timeout).await
 }
 
 /// Stream live tags to the accepted player until it leaves, EOS arrives,
@@ -1703,7 +1560,7 @@ async fn send_cached_header(
 async fn stream_to_player(
   session: &mut ServerSession,
   stream: &mut RtmpStream,
-  stream_id: StreamId,
+  stream_id: StreamHandle,
   demux: &mut FlvDemux,
   headers: &mut HeaderCache,
   data_receiver: &flume::Receiver<Vec<u8>>,
@@ -1740,11 +1597,7 @@ async fn stream_to_player(
     }
   }
   live.player_connected.store(true, Ordering::Release);
-  // Dummy channel kept alive for the serve loop in case a future rtmpx
-  // version routes replies through it; today the serve path writes packets
-  // directly.
-  let (dummy_output, _dummy_rx) = flume::bounded::<crate::common::WorkerOutput>(1);
-  let mut read_buf = vec![0u8; 16 * 1024];
+  let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     tokio::select! {
       _ = cancellation.cancelled() => {
@@ -1757,23 +1610,20 @@ async fn stream_to_player(
           let mut failed: Option<SessionFailure> = None;
           for tag in demux.push(&chunk) {
             headers.observe(&tag);
-            // Script tags are skipped on the serve path: the server side
-            // only has send_metadata, no raw AMF send.
-            if tag.tag_type == FLV_TAG_SCRIPT_DATA {
-              continue;
-            }
             let timestamp = RtmpTimestamp::new(tag.timestamp);
             let packet = match tag.tag_type {
               FLV_TAG_VIDEO => session
-                .send_video_data(stream_id, Bytes::from(tag.payload), timestamp, false)
+                .send_video(stream_id, Bytes::from(tag.payload), timestamp, rtmpx::DropPolicy::Never)
                 .map_err(|error| {
                   SessionFailure::error(format!("failed to frame video data: {error:?}"))
                 }),
               FLV_TAG_AUDIO => session
-                .send_audio_data(stream_id, Bytes::from(tag.payload), timestamp, false)
+                .send_audio(stream_id, Bytes::from(tag.payload), timestamp, rtmpx::DropPolicy::Never)
                 .map_err(|error| {
                   SessionFailure::error(format!("failed to frame audio data: {error:?}"))
                 }),
+              FLV_TAG_SCRIPT_DATA => session.send_data(stream_id, DataMessage::new(DataMessageType::Amf0, timestamp, tag.payload))
+                .map_err(|error| SessionFailure::error(format!("failed to frame script data: {error}"))),
               _ => continue,
             };
             let packet = match packet {
@@ -1784,7 +1634,7 @@ async fn stream_to_player(
               }
             };
             if let Err(failure) =
-              write_packet_bytes(stream, &packet.bytes, write_timeout).await
+              crate::common::write_packet(stream, packet, write_timeout).await
             {
               failed = Some(failure);
               break;
@@ -1802,8 +1652,8 @@ async fn stream_to_player(
         }
         Err(flume::RecvError::Disconnected) => {
           live.player_connected.store(false, Ordering::Release);
-          if let Ok(packet) = session.finish_playing(stream_id) {
-            let _ = write_packet_bytes(stream, &packet.bytes, write_timeout).await;
+          if session.complete_playback(stream_id).is_ok() {
+            let _ = flush_server(stream, session, write_timeout).await;
           }
           let _ = stream.shutdown().await;
           return PlayerOutcome::Eos;
@@ -1830,30 +1680,27 @@ async fn stream_to_player(
           gst::info!(CAT_SINK, "RTMP player closed the connection");
           return PlayerOutcome::PlayerDone;
         }
-        let results = match session.handle_input(&read_buf[..n]) {
-          Ok(results) => results,
-          Err(error) => {
-            live.player_connected.store(false, Ordering::Release);
-            gst::warning!(CAT_SINK, "Player sent unreadable RTMP: {error:?}");
-            return PlayerOutcome::PlayerDone;
-          }
-        };
+        let mut results = read_buf.split().freeze();
         let mut player_over = false;
-        for result in results {
+        loop {
+          let result = match session.receive(&mut results) {
+            Ok(Some(result)) => result, Ok(None) => break,
+            Err(error) => { live.player_connected.store(false, Ordering::Release); gst::warning!(CAT_SINK, "Invalid RTMP input: {error}"); return PlayerOutcome::PlayerDone; }
+          };
           match result {
-            ServerSessionResult::OutboundResponse(packet) => {
-              if write_packet_bytes(stream, &packet.bytes, write_timeout).await.is_err() {
+            ServerOutput::Packet(packet) => {
+              if crate::common::write_packet(stream, packet, write_timeout).await.is_err() {
                 live.player_connected.store(false, Ordering::Release);
                 gst::info!(CAT_SINK, "RTMP player went away");
                 return PlayerOutcome::PlayerDone;
               }
             }
-            ServerSessionResult::RaisedEvent(ServerSessionEvent::PlayStreamFinished { stream_key, .. }) => {
+            ServerOutput::Event(ServerEvent::PlayStreamFinished { stream_key, .. }) => {
               gst::info!(CAT_SINK, "RTMP player stopped playing '{stream_key}'");
               player_over = true;
             }
-            ServerSessionResult::UnhandleableMessageReceived(_) => {}
-      _ => {}
+            ServerOutput::UnhandledMessage(_) => {}
+            _ => {}
           }
         }
         if player_over {
@@ -1861,10 +1708,6 @@ async fn stream_to_player(
           let _ = stream.shutdown().await;
           return PlayerOutcome::PlayerDone;
         }
-        // Keep the dummy channel referenced so it clearly outlives the
-        // serve loop if a future rtmpx version routes replies through
-        // it; today the serve path writes packets directly.
-        let _ = &dummy_output;
       }
     }
   }
