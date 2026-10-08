@@ -498,7 +498,7 @@ dependencies = [
  "gstreamer-check",
  "rcgen",
  "rtmpx 2.0.0",
- "rtmpx 3.0.0",
+ "rtmpx 3.1.1",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -980,9 +980,9 @@ dependencies = [
 
 [[package]]
 name = "rtmpx"
-version = "3.0.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddfbafc58debf10426f7bca12f4f9fadebbc39d3bcf05a431ad6af0e039c6ab7"
+checksum = "e2950dfb8c61a06109f964c5ac48c674d9096b0af041cedc80ac5fc3035eb67f"
 dependencies = [
  "byteorder",
  "bytes",
