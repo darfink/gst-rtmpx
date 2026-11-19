@@ -29,12 +29,11 @@ ENV PATH=/root/.cargo/bin:${PATH}
 WORKDIR /work
 
 # Dependencies first, so editing the elements does not rebuild the world.
-COPY Cargo.toml Cargo.lock ./
-COPY gst-rtmpx/Cargo.toml gst-rtmpx/build.rs ./gst-rtmpx/
-RUN mkdir -p gst-rtmpx/src && echo '' > gst-rtmpx/src/lib.rs && cargo build --release || true
+COPY Cargo.toml Cargo.lock build.rs ./
+RUN mkdir -p src && echo '' > src/lib.rs && cargo build --release || true
 
-COPY gst-rtmpx/src ./gst-rtmpx/src
-RUN touch gst-rtmpx/src/lib.rs && cargo build --release --locked
+COPY src ./src
+RUN touch src/lib.rs && cargo build --release --locked
 
 FROM ubuntu:26.04 AS runtime
 
@@ -61,6 +60,6 @@ EXPOSE 1935
 # Accept one publisher and demux it. Override the command to build your own
 # pipeline around the elements.
 CMD ["gst-launch-1.0", "-e", \
-     "rtmpxsrc", "uri=rtmp://0.0.0.0:1935/live", "!", "flvdemux", "name=demux", \
+     "rtmpxsrc", "mode=listen", "uri=rtmp://0.0.0.0:1935/live", "!", "flvdemux", "name=demux", \
      "demux.video", "!", "queue", "!", "h264parse", "!", "fakesink", "sync=false", \
      "demux.audio", "!", "queue", "!", "aacparse", "!", "fakesink", "sync=false"]
