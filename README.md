@@ -5,6 +5,7 @@
 ## GStreamer RTMP and RTMPS source & sink with built-in listen modes
 
 [![CI][ci-shield]][ci]
+[![crates.io][crate-shield]][crate]
 [![Version][version-shield]][releases]
 [![GStreamer][gstreamer-shield]][gstreamer]
 [![License][license-shield]][license]
@@ -129,6 +130,22 @@ docker build -t gst-rtmpx .
 docker run --rm -p 1935:1935 gst-rtmpx
 ```
 
+### Embedding in a Rust application
+
+To register `rtmpxsrc` and `rtmpxsink` statically inside a Rust GStreamer application without installing a shared library, add `gst-rtmpx` to `Cargo.toml`:
+
+```toml
+[dependencies]
+gst-rtmpx = "0.3"
+```
+
+Note that the Rust library crate name is `gstrtmpx`:
+
+```rust
+gst::init()?;
+gstrtmpx::plugin_register_static()?;
+```
+
 ## Element reference
 
 ### `rtmpxsrc`
@@ -209,6 +226,8 @@ Dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICEN
 
 [ci-shield]: https://img.shields.io/github/actions/workflow/status/darfink/gst-rtmpx/ci.yml?branch=main&label=CI&logo=github&style=for-the-badge
 [ci]: https://github.com/darfink/gst-rtmpx/actions/workflows/ci.yml?query=branch%3Amain
+[crate-shield]: https://img.shields.io/crates/v/gst-rtmpx.svg?style=for-the-badge
+[crate]: https://crates.io/crates/gst-rtmpx
 [version-shield]: https://img.shields.io/github/v/tag/darfink/gst-rtmpx?style=for-the-badge&label=version
 [releases]: https://github.com/darfink/gst-rtmpx/releases
 [gstreamer-shield]: https://img.shields.io/badge/GStreamer-1.28+-orange?style=for-the-badge
