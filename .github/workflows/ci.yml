@@ -47,9 +47,15 @@ jobs:
             gstreamer1.0-plugins-bad gstreamer1.0-tools ffmpeg
       - name: Install GStreamer (macOS)
         if: runner.os == 'macOS'
-        run: brew install gstreamer ffmpeg
+        run: |
+          brew install gstreamer ffmpeg
+          # Homebrew moves GStreamer's keg path between versions, and cached
+          # build-script output links against the old one. Key on it.
+          echo "GST_CACHE_KEY=gst-$(pkg-config --modversion gstreamer-1.0)" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.GST_CACHE_KEY }}
       - run: cargo build --locked
       - run: cargo test --locked
       - name: Verify plugins register

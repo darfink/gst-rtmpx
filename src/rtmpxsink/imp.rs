@@ -1316,6 +1316,7 @@ async fn serve_one_player(
           &mut session,
           &mut stream,
           stream_id,
+          results,
           demux,
           headers,
           data_receiver,
@@ -1371,6 +1372,7 @@ async fn serve_one_player(
           &mut session,
           &mut stream,
           stream_id,
+          results,
           demux,
           headers,
           data_receiver,
@@ -1401,7 +1403,6 @@ async fn pump_until_play(
   _cancellation: &CancellationToken,
   write_timeout: &Option<Duration>,
 ) -> PlayWait {
-  let mut accepted = None;
   loop {
     let result = match session.receive(results) {
       Ok(Some(result)) => result,
@@ -1479,11 +1480,12 @@ async fn pump_until_play(
               return PlayWait::Gone;
             }
           };
-          if flush_server(stream, session, write_timeout).await.is_err() {
-            return PlayWait::Gone;
-          }
+          // Leave Play.Start queued in the session until stream_to_player
+          // drains stale media and marks player_connected; flushing here
+          // would let the player wake up and trigger live pushes before the
+          // stale-queue drain runs, dropping fresh frames as stale.
           gst::info!(CAT_SINK, "RTMP player is playing '{app_name}/{stream_key}'");
-          accepted = Some(handle);
+          return PlayWait::Accepted(handle);
         }
         // A publisher on a sink listener is as welcome as a player on a
         // src listener: reject it the same way so the port keeps serving.
@@ -1519,7 +1521,49 @@ async fn pump_until_play(
       _ => {}
     }
   }
-  accepted.map_or(PlayWait::NeedMore, PlayWait::Accepted)
+  PlayWait::NeedMore
+}
+
+/// Process a chunk of player input during active playback. Returns true when
+/// the player closed playback cleanly or failed so the caller can disconnect.
+async fn drain_player_input(
+  session: &mut ServerSession,
+  stream: &mut RtmpStream,
+  results: &mut Bytes,
+  write_timeout: &Option<Duration>,
+) -> bool {
+  let mut player_over = false;
+  loop {
+    let result = match session.receive(results) {
+      Ok(Some(result)) => result,
+      Ok(None) => break,
+      Err(error) => {
+        gst::warning!(CAT_SINK, "Invalid RTMP input: {error}");
+        return true;
+      }
+    };
+    match result {
+      ServerOutput::Packet(packet) => {
+        if crate::common::write_packet(stream, packet, write_timeout)
+          .await
+          .is_err()
+        {
+          gst::info!(CAT_SINK, "RTMP player went away");
+          return true;
+        }
+      }
+      ServerOutput::Event(ServerEvent::PlayStreamFinished { stream_key, .. }) => {
+        gst::info!(CAT_SINK, "RTMP player stopped playing '{stream_key}'");
+        player_over = true;
+      }
+      ServerOutput::UnhandledMessage(_) => {}
+      _ => {}
+    }
+  }
+  if player_over {
+    let _ = stream.shutdown().await;
+  }
+  player_over
 }
 
 /// Send one cached sequence header to a fresh player.
@@ -1561,6 +1605,7 @@ async fn stream_to_player(
   session: &mut ServerSession,
   stream: &mut RtmpStream,
   stream_id: StreamHandle,
+  mut leftover: Bytes,
   demux: &mut FlvDemux,
   headers: &mut HeaderCache,
   data_receiver: &flume::Receiver<Vec<u8>>,
@@ -1569,11 +1614,11 @@ async fn stream_to_player(
   read_timeout: &Option<Duration>,
   write_timeout: &Option<Duration>,
 ) -> PlayerOutcome {
-  // Drain anything queued while nobody was listening through the demux so
-  // the cache is current, then replay the cached sequence headers so the
-  // joiner can decode from the live edge. The drained bytes are stale
-  // media, never resent.
-  loop {
+  // Drain only the snapshot of chunks already queued before the player
+  // joined (bounding by len() prevents a fast producer from livelocking the
+  // drain), updating the header cache without resending stale media.
+  let stale_chunks = data_receiver.len();
+  for _ in 0..stale_chunks {
     match data_receiver.try_recv() {
       Ok(chunk) => {
         for tag in demux.push(&chunk) {
@@ -1584,10 +1629,26 @@ async fn stream_to_player(
       Err(flume::TryRecvError::Disconnected) => return PlayerOutcome::Eos,
     }
   }
+  if data_receiver.is_empty() && data_receiver.is_disconnected() {
+    return PlayerOutcome::Eos;
+  }
+  // Mark connected before flushing Play.Start so wait-for-connection=false
+  // stops dropping before the player observes playback acceptance.
+  live.player_connected.store(true, Ordering::Release);
+  if let Err(failure) = flush_server(stream, session, write_timeout).await {
+    live.player_connected.store(false, Ordering::Release);
+    gst::info!(
+      CAT_SINK,
+      "RTMP player left while accepting play: {}",
+      failure.message
+    );
+    return PlayerOutcome::PlayerDone;
+  }
   for cached in headers.ordered() {
     if let Err(failure) =
       send_cached_header(session, stream, stream_id, &cached, write_timeout).await
     {
+      live.player_connected.store(false, Ordering::Release);
       gst::info!(
         CAT_SINK,
         "RTMP player left during header replay: {}",
@@ -1596,7 +1657,11 @@ async fn stream_to_player(
       return PlayerOutcome::PlayerDone;
     }
   }
-  live.player_connected.store(true, Ordering::Release);
+  if !leftover.is_empty() && drain_player_input(session, stream, &mut leftover, write_timeout).await
+  {
+    live.player_connected.store(false, Ordering::Release);
+    return PlayerOutcome::PlayerDone;
+  }
   let mut read_buf = BytesMut::with_capacity(16 * 1024);
   loop {
     tokio::select! {
@@ -1681,31 +1746,8 @@ async fn stream_to_player(
           return PlayerOutcome::PlayerDone;
         }
         let mut results = read_buf.split().freeze();
-        let mut player_over = false;
-        loop {
-          let result = match session.receive(&mut results) {
-            Ok(Some(result)) => result, Ok(None) => break,
-            Err(error) => { live.player_connected.store(false, Ordering::Release); gst::warning!(CAT_SINK, "Invalid RTMP input: {error}"); return PlayerOutcome::PlayerDone; }
-          };
-          match result {
-            ServerOutput::Packet(packet) => {
-              if crate::common::write_packet(stream, packet, write_timeout).await.is_err() {
-                live.player_connected.store(false, Ordering::Release);
-                gst::info!(CAT_SINK, "RTMP player went away");
-                return PlayerOutcome::PlayerDone;
-              }
-            }
-            ServerOutput::Event(ServerEvent::PlayStreamFinished { stream_key, .. }) => {
-              gst::info!(CAT_SINK, "RTMP player stopped playing '{stream_key}'");
-              player_over = true;
-            }
-            ServerOutput::UnhandledMessage(_) => {}
-            _ => {}
-          }
-        }
-        if player_over {
+        if drain_player_input(session, stream, &mut results, write_timeout).await {
           live.player_connected.store(false, Ordering::Release);
-          let _ = stream.shutdown().await;
           return PlayerOutcome::PlayerDone;
         }
       }

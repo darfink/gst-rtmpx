@@ -213,7 +213,6 @@ fn sink_listen_replays_headers_to_mid_stream_joiner() {
   push_bytes(&mut sink, &frame_tag(8, 60, &stale_a));
   let (ready, player) = spawn_player(port, "live", "mid", 2, 2);
   wait_ready(&ready, "mid-stream joiner");
-  std::thread::sleep(Duration::from_millis(500));
   push_bytes(&mut sink, &frame_tag(9, 8000, &live_v));
   push_bytes(&mut sink, &frame_tag(8, 8020, &live_a));
   let collected = player.join().expect("player thread must finish");
@@ -341,7 +340,6 @@ fn sink_listen_wait_for_connection_false_drops_without_player() {
   let live_a = vec![0xAF, 0x01, 0x66];
   let (ready, player) = spawn_player(port, "live", "drop", 2, 2);
   wait_ready(&ready, "drop then live");
-  std::thread::sleep(Duration::from_millis(500));
   push_bytes(&mut sink, &frame_tag(9, 9000, &vseq));
   push_bytes(&mut sink, &frame_tag(8, 9000, &aseq));
   push_bytes(&mut sink, &frame_tag(9, 9040, &live_v));
