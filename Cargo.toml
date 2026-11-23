@@ -22,7 +22,7 @@ capi = []
 [dependencies]
 bytes = "1.12"
 # Protocol sessions (client + server) come from the rtmpx crate on crates.io.
-rtmpx = "3.0"
+rtmpx = "4"
 flume = "0.12"
 gst = { package = "gstreamer", version = "0.25.3", features = ["v1_28"] }
 gst-base = { package = "gstreamer-base", version = "0.25.3", features = ["v1_28"] }
